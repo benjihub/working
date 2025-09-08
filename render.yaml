@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: goodcasino-bot
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: PORT
+        value: 10000
+      # Set the rest in the Render Dashboard for security
+      - key: LIVECHAT_CLIENT_ID
+        sync: false
+      - key: LIVECHAT_PAT
+        sync: false
+      - key: LIVECHAT_WEBHOOK_URL
+        sync: false
+      - key: LIVECHAT_WEBHOOK_SECRET
+        sync: false
+      - key: BOT_SECRET
+        sync: false
+      - key: LIVECHAT_REPLY_COOLDOWN_MS
+        value: 5000
+      - key: USE_OPENAI
+        value: false
+      - key: OPENAI_API_KEY
+        sync: false

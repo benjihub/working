@@ -1,7 +1,10 @@
+// server.js
+// Express server for LiveChat + local APIs
 require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
+const { sendMessage: sendLivechatMessage } = require('./livechatApi');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs').promises;
@@ -46,7 +49,7 @@ const {
 } = require('./newtest3');
 
 const app = express();
-const INITIAL_PORT = parseInt(process.env.PORT || '3001', 10);
+const INITIAL_PORT = parseInt(process.env.PORT || '3002', 10);
 const HOST = '0.0.0.0';
 
 // Early lightweight request logger (logs all requests)
@@ -60,6 +63,24 @@ app.use((req, _res, next) => {
 // Global server instance
 let serverInstance = null;
 let activePort = INITIAL_PORT;
+
+// In-memory deduplication for webhook events (prevent spam on duplicates)
+const processedEvents = new Map(); // id -> timestamp
+function isDuplicateEvent(eventId, ttlMs = 5 * 60 * 1000) {
+  if (!eventId) return false;
+  const now = Date.now();
+  const prev = processedEvents.get(eventId);
+  if (prev && now - prev < ttlMs) return true;
+  processedEvents.set(eventId, now);
+  // occasional prune
+  if (processedEvents.size > 5000) {
+    const cutoff = now - ttlMs;
+    for (const [id, ts] of processedEvents) {
+      if (ts < cutoff) processedEvents.delete(id);
+    }
+  }
+  return false;
+}
 
 // Function to get server instance
 function getServerInstance() {
@@ -198,6 +219,74 @@ app.use(express.static(__dirname));
 // Also serve assets from ./public for the web chat UI
 app.use(express.static(path.join(__dirname, 'public')));
 
+// LiveChat webhook endpoint
+// Lightweight GET for external health checks
+app.get('/livechat/webhook', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
+app.post('/livechat/webhook', async (req, res) => {
+  const { secret_key, action, payload } = req.body || {};
+  const headerSecret = (req.headers['x-webhook-secret'] ?? req.headers['x-livechat-webhook-secret'] ?? '').toString().trim();
+  const provided = ((secret_key ?? headerSecret) || '').toString().trim();
+  const expected = (process.env.LIVECHAT_WEBHOOK_SECRET ?? '').toString().trim();
+  if (!expected || provided !== expected) {
+    console.warn('Invalid webhook secret', { providedLen: provided.length, expectedSet: !!expected });
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  console.log('Webhook action:', action);
+  console.log('Webhook payload:', payload);
+  // Ack immediately to prevent LiveChat retries
+  res.json({ status: 'received' });
+
+  // Process asynchronously to avoid timeouts/retries
+  setImmediate(async () => {
+    try {
+      if (!(action === 'incoming_event' && payload?.event?.type === 'message')) return;
+
+      const chatId = payload.chat_id;
+      const text = payload.event?.text || '';
+      const eventId = payload.event?.id || payload.event?.custom_id;
+      if (isDuplicateEvent(eventId)) {
+        console.log('Ignored duplicate event', eventId);
+        return;
+      }
+      // Avoid loops: ignore events created by this app/client_id
+      const sourceClient = payload?.event?.properties?.source?.client_id;
+      if (sourceClient && process.env.LIVECHAT_CLIENT_ID && sourceClient === process.env.LIVECHAT_CLIENT_ID) {
+        console.log('Ignored own message');
+        return;
+      }
+  // Only respond to customer messages; try multiple shapes
+  const authorType = payload?.event?.author_type || payload?.event?.properties?.source?.type || payload?.author_type;
+      if (authorType && authorType !== 'customer') {
+        console.log('Ignored non-customer message');
+        return;
+      }
+
+      // Cooldown per chat to avoid rapid-fire replies
+      const cooldownMs = parseInt(process.env.LIVECHAT_REPLY_COOLDOWN_MS || '3000', 10);
+      if (!global.__lastReplyByChat) global.__lastReplyByChat = new Map();
+      const now = Date.now();
+      const last = global.__lastReplyByChat.get(chatId) || 0;
+      if (now - last < cooldownMs) {
+        console.log('Cooldown active; skipping reply', { chatId, waited: now - last });
+        return;
+      }
+      global.__lastReplyByChat.set(chatId, now);
+
+      // Generate a smart reply via GoodCasino bot logic
+      gcGetChatState(chatId);
+      const reply = await gcGetResponse(chatId, text, `${chatId}_${Date.now()}`);
+      const finalText = (reply && reply.trim()) ? reply.trim() : 'Thanks for your message.';
+      await sendLivechatMessage(chatId, finalText);
+      console.log('Bot reply sent');
+    } catch (err) {
+      console.error('Error processing webhook:', err.response?.data || err.message);
+    }
+  });
+});
+
 
 // API endpoint to get dashboard stats
 app.get('/api/dashboard/stats', async (req, res) => {
@@ -291,7 +380,7 @@ function detectSupportEvent(textRaw) {
 }
 
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'newtest4.html'));
+  res.sendFile(path.join(__dirname, 'public', 'web-chat.html'));
 });
 
 // Simple route to the GoodCasino web chat UI
@@ -299,19 +388,13 @@ app.get('/web-chat', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'web-chat.html'));
 });
 
-// Use the same LiveChat token as the bot (read from .env)
-const ACCESS_TOKEN = process.env.LIVECHAT_ACCESS_TOKEN || '';
-if (!ACCESS_TOKEN) {
-  console.warn('WARNING: LIVECHAT_ACCESS_TOKEN not set. LiveChat endpoints may fail.');
-}
-
-// LiveChat API helper: try Basic or Bearer depending on token shape
+// LiveChat API helper: prefer Basic auth (username/password or base64 PAT), fallback to Bearer
+const { getHeaderVariants } = require('./livechatAuth');
 async function livechatPost(path, body, { timeout = 15000 } = {}) {
-  const token = ACCESS_TOKEN || '';
-  const looksBase64 = typeof token === 'string' && /^[A-Za-z0-9+/=]+$/.test(token) && token.includes('=');
-  const headerVariants = looksBase64
-    ? [ { Authorization: `Basic ${token}` }, { Authorization: `Bearer ${token}` } ]
-    : [ { Authorization: `Bearer ${token}` }, { Authorization: `Basic ${token}` } ];
+  const headerVariants = getHeaderVariants();
+  if (!headerVariants || headerVariants.length === 0) {
+    return { ok: false, error: 'LiveChat credentials not set', status: 401 };
+  }
   let lastErr = null;
   for (const headers of headerVariants) {
     try {
@@ -498,36 +581,7 @@ let settings = {
   endMessage: 'Thank you boss, we wish you good luck! 😘'
 };
 
-// Safe helper to send message sequentially (avoid duplicate parallel sends)
-async function sendMessage(chatId, message) {
-  try {
-    const response = await axios.post(
-      'https://api.livechatinc.com/v3.5/agent/action/send_event',
-      {
-        chat_id: chatId,
-        event: {
-          type: 'message',
-          text: message,
-          recipients: 'all'
-        }
-      },
-      {
-        headers: {
-          // Use Bearer auth per request
-          Authorization: `Bearer ${ACCESS_TOKEN}`,
-          'Content-Type': 'application/json',
-          Accept: 'application/json'
-        },
-        timeout: 3000
-      }
-    );
-    console.log(`✅ Message sent to ${chatId}`);
-    return { success: true, data: response.data };
-  } catch (error) {
-    console.log('sendMessage failed:', error.response?.data?.error?.message || error.message);
-    return { success: false, error: error.response?.data?.error?.message || error.message };
-  }
-}
+// (Note) LiveChat send is handled via helper in livechatApi.js
 
 // Enhanced send-message endpoint with smart AI
 app.post('/send-message', async (req, res) => {
@@ -781,7 +835,30 @@ app.get('/settings', (req, res) => {
 
 // --- GoodCasino Bot (newtest3) local chat endpoint ---
 app.get('/api/bot/health', (req, res) => {
-  res.json({ success: true, status: 'ok' });
+  res.json({ status: 'ok' });
+});
+// Preflight for CORS
+app.options('/api/bot/chat', (req, res) => res.sendStatus(204));
+// Simple GET support for convenience/testing
+app.get('/api/bot/chat', async (req, res) => {
+  try {
+    const requiredSecret = process.env.BOT_SECRET || '';
+    if (requiredSecret) {
+      const provided = req.headers['x-bot-secret'];
+      if (!provided || provided !== requiredSecret) {
+        return res.status(401).json({ success: false, error: 'Unauthorized' });
+      }
+    }
+    const id = (req.query.chatId && String(req.query.chatId).trim()) || `web_${Date.now()}`;
+    const message = (req.query.message && String(req.query.message)) || '';
+    if (!message) return res.status(400).json({ success: false, error: 'message is required' });
+    gcGetChatState(id);
+    const reply = await gcGetResponse(id, message, `${id}_${Date.now()}`);
+    return res.json({ success: true, chatId: id, reply: reply || '' });
+  } catch (e) {
+    console.error('Error in GET /api/bot/chat:', e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
 });
 // Preflight for CORS
 app.options('/api/bot/chat', (req, res) => res.sendStatus(204));
