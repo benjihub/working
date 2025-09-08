@@ -52,14 +52,6 @@ const app = express();
 const INITIAL_PORT = parseInt(process.env.PORT || '3002', 10);
 const HOST = '0.0.0.0';
 
-// Early lightweight request logger (logs all requests)
-app.use((req, _res, next) => {
-  try {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
-  } catch (_) {}
-  next();
-});
-
 // Global server instance
 let serverInstance = null;
 let activePort = INITIAL_PORT;
@@ -193,17 +185,29 @@ async function updateChatActivity(chatId, userId) {
   const now = Math.floor(Date.now() / 1000);
   activeUsers.add(userId);
   openTickets.add(chatId);
-
-  // Update last activity in the database (better-sqlite3 is synchronous)
+  
+  // Update last activity in the database
   try {
     if (!db) {
       console.error('Database not initialized');
       return;
     }
-    db.prepare('INSERT OR IGNORE INTO chats (id, state, last_activity) VALUES (?, ?, ?)')
-      .run(chatId, '{}', now);
-    db.prepare('UPDATE chats SET last_activity = ? WHERE id = ?')
-      .run(now, chatId);
+    
+    await new Promise((resolve, reject) => {
+      db.run(
+        'INSERT OR IGNORE INTO chats (id, state, last_activity) VALUES (?, ?, ?)',
+        [chatId, '{}', now],
+        (err) => err ? reject(err) : resolve()
+      );
+    });
+    
+    await new Promise((resolve, reject) => {
+      db.run(
+        'UPDATE chats SET last_activity = ? WHERE id = ?',
+        [now, chatId],
+        (err) => err ? reject(err) : resolve()
+      );
+    });
   } catch (error) {
     console.error('Error updating chat activity:', error);
   }
@@ -295,30 +299,11 @@ app.get('/api/dashboard/stats', async (req, res) => {
       throw new Error('Database not initialized');
     }
 
-    // Try fast SQL path using JSON1; fall back to JS parsing if unavailable
-    let stats = { totalChats: 0, uniqueUsers: 0 };
-    try {
-      const row = db.prepare(
-        'SELECT COUNT(*) AS totalChats, COUNT(DISTINCT json_extract(state, "$.context.userId")) AS uniqueUsers FROM chats'
-      ).get();
-      if (row) stats = row;
-    } catch (jsonErr) {
-      try {
-        const totalRow = db.prepare('SELECT COUNT(*) AS totalChats FROM chats').get();
-        const allStates = db.prepare('SELECT state FROM chats').all();
-        const set = new Set();
-        for (const r of allStates) {
-          try {
-            const st = typeof r.state === 'string' ? JSON.parse(r.state) : r.state;
-            const uid = st?.context?.userId;
-            if (uid) set.add(String(uid));
-          } catch (_) {}
-        }
-        stats = { totalChats: totalRow?.totalChats || 0, uniqueUsers: set.size };
-      } catch (fallbackErr) {
-        throw fallbackErr;
-      }
-    }
+    // better-sqlite3 is synchronous; use .prepare().get()
+    const row = db.prepare(
+      'SELECT COUNT(*) AS totalChats, COUNT(DISTINCT json_extract(state, "$.userId")) AS uniqueUsers FROM chats'
+    ).get();
+    const stats = row || { totalChats: 0, uniqueUsers: 0 };
     
     res.json({
       activeUsers: stats.uniqueUsers || 0,
@@ -326,9 +311,8 @@ app.get('/api/dashboard/stats', async (req, res) => {
       timestamp: Date.now()
     });
   } catch (error) {
-  console.error('Error getting dashboard stats:', error && (error.stack || error.message || error));
-  // Be resilient: return zeros instead of failing the entire dashboard
-  res.json({ activeUsers: 0, openTickets: 0, timestamp: Date.now(), note: 'stats-fallback' });
+    console.error('Error getting dashboard stats:', error);
+    res.status(500).json({ error: 'Failed to get dashboard stats' });
   }
 });
 
@@ -672,13 +656,15 @@ app.post('/send-message', async (req, res) => {
       // Save initial state to database
       await updateChatState(db, chatId, parsedState);
     } else {
-      // db-utils.getChatState already returns parsed JSON state
-      parsedState = chatState;
+      // Parse the existing state
+      parsedState = typeof chatState.state === 'string' ? JSON.parse(chatState.state) : chatState.state;
     }
     
-  // Save user message to database (use initialized better-sqlite3 instance)
-  if (!db) throw new Error('Database not initialized');
-  await addMessage(db, chatId, 'user', message);
+    // Get database instance once
+    const db = getDb();
+    
+    // Save user message to database
+    await addMessage(db, chatId, 'user', message);
     
     // Get smart response - pass the parsed state to getSmartResponse
     const response = await getSmartResponse(chatId, message);
@@ -688,8 +674,8 @@ app.post('/send-message', async (req, res) => {
       await addMessage(db, chatId, 'assistant', response);
     }
     
-  // Update chat state in database with the parsed state
-  await updateChatState(db, chatId, parsedState);
+    // Update chat state in database with the parsed state
+    await updateChatState(db, chatId, parsedState);
     
     res.json({ 
       success: true, 
@@ -711,8 +697,8 @@ app.post('/send-message', async (req, res) => {
 app.get('/chat-state/:chatId', async (req, res) => {
   try {
     const { chatId } = req.params;
-  if (!db) throw new Error('Database not initialized');
-  const chatState = await getChatState(db, chatId);
+    const db = getDb();
+    const chatState = await getChatState(db, chatId);
     
     if (!chatState) {
       return res.status(404).json({ success: false, error: 'Chat not found' });
@@ -721,8 +707,8 @@ app.get('/chat-state/:chatId', async (req, res) => {
     // Get chat messages
     const messages = await getChatMessages(db, chatId);
     
-  // db-utils.getChatState already returns parsed JSON state
-  const parsedState = chatState;
+    // Parse the chat state from JSON string if needed
+    const parsedState = typeof chatState.state === 'string' ? JSON.parse(chatState.state) : chatState.state;
     
     res.json({
       success: true,
@@ -860,29 +846,6 @@ app.get('/api/bot/chat', async (req, res) => {
     return res.status(500).json({ success: false, error: e.message });
   }
 });
-// Preflight for CORS
-app.options('/api/bot/chat', (req, res) => res.sendStatus(204));
-// Simple GET support for convenience/testing
-app.get('/api/bot/chat', async (req, res) => {
-  try {
-    const requiredSecret = process.env.BOT_SECRET || '';
-    if (requiredSecret) {
-      const provided = req.headers['x-bot-secret'];
-      if (!provided || provided !== requiredSecret) {
-        return res.status(401).json({ success: false, error: 'Unauthorized' });
-      }
-    }
-    const id = (req.query.chatId && String(req.query.chatId).trim()) || `web_${Date.now()}`;
-    const message = (req.query.message && String(req.query.message)) || '';
-    if (!message) return res.status(400).json({ success: false, error: 'message is required' });
-    gcGetChatState(id);
-    const reply = await gcGetResponse(id, message, `${id}_${Date.now()}`);
-    return res.json({ success: true, chatId: id, reply: reply || '' });
-  } catch (e) {
-    console.error('Error in GET /api/bot/chat:', e);
-    return res.status(500).json({ success: false, error: e.message });
-  }
-});
 app.post('/api/bot/chat', async (req, res) => {
   try {
     const requiredSecret = process.env.BOT_SECRET || '';
@@ -899,33 +862,10 @@ app.post('/api/bot/chat', async (req, res) => {
     const id = chatId && String(chatId).trim() ? String(chatId).trim() : `web_${Date.now()}`;
     // Ensure state exists and get reply from GoodCasino bot
     gcGetChatState(id);
-    let reply;
-    try {
-      reply = await gcGetResponse(id, message, `${id}_${Date.now()}`);
-    } catch (botErr) {
-      console.error('gcGetResponse failed:', botErr && (botErr.stack || botErr.message || botErr));
-      reply = 'Maaf bosku, lagi ada kendala sebentar. Coba ketik lagi ya. 🙏';
-    }
+    const reply = await gcGetResponse(id, message, `${id}_${Date.now()}`);
     return res.json({ success: true, chatId: id, reply: reply || '' });
   } catch (e) {
-    console.error('Error in /api/bot/chat:', e && (e.stack || e.message || e));
-    return res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// Chatbot widget endpoint used by dashboard live chat widget
-app.post('/chatbot', async (req, res) => {
-  try {
-    const { message } = req.body || {};
-    if (!message || typeof message !== 'string') {
-      return res.status(400).json({ success: false, error: 'message is required' });
-    }
-    const id = `widget_${Date.now()}`;
-    gcGetChatState(id);
-    const reply = await gcGetResponse(id, message, `${id}_1`);
-    return res.json({ success: true, reply: reply || '' });
-  } catch (e) {
-    console.error('Error in /chatbot:', e);
+    console.error('Error in /api/bot/chat:', e);
     return res.status(500).json({ success: false, error: e.message });
   }
 });
@@ -998,73 +938,6 @@ app.post('/api/livechat/send/:chatId', async (req, res) => {
   if (!resp.ok) return res.status(resp.status).json({ success: false, error: resp.error, details: resp.raw });
   res.json({ success: true, result: resp.data });
 });
-
-// --- LiveChat Webhook (for local dev via ngrok or production webhooks) ---
-// Configure LIVECHAT_WEBHOOK_SECRET in .env and set it in LiveChat console if supported, or pass via header x-webhook-secret when testing.
-app.post('/livechat/webhook', async (req, res) => {
-  try {
-    const shared = process.env.LIVECHAT_WEBHOOK_SECRET || '';
-    if (shared) {
-      // LiveChat sends secret_key in the webhook body. Allow header override for manual testing.
-      const providedHeader = req.headers['x-webhook-secret'];
-      const providedBody = req.body?.secret_key;
-      if (providedBody !== shared && providedHeader !== shared) {
-        return res.status(401).json({ success: false, error: 'Unauthorized' });
-      }
-    }
-
-    const { action, payload } = req.body || {};
-    console.log('🔔 LiveChat webhook:', action);
-
-    // Basic greeting when a chat starts
-    if (action === 'incoming_chat') {
-      try {
-        const chatId = payload?.chat?.id || payload?.chat_id;
-        if (chatId) {
-          const send = await livechatPost('/agent/action/send_event', {
-            chat_id: chatId,
-            event: { type: 'message', text: 'Halo bosku! 👋 Ada yang bisa saya bantu?', recipients: 'all' }
-          }, {});
-          if (!send.ok) console.warn('Webhook greeting failed:', send.error);
-        }
-      } catch (e) {
-        console.warn('incoming_chat handler error:', e.message);
-      }
-    }
-
-    // Respond to incoming messages
-    if (action === 'incoming_event') {
-      try {
-        const chatId = payload?.chat?.id || payload?.chat_id;
-        const ev = payload?.event || {};
-        if (chatId && ev.type === 'message' && ev.text) {
-          // Try GoodCasino bot reply first; fall back to simple echo
-          let reply = '';
-          try {
-            const id = String(chatId);
-            gcGetChatState(id);
-            reply = await gcGetResponse(id, ev.text, `${id}_${Date.now()}`);
-          } catch (_) {
-            reply = `Bot response to: ${ev.text}`;
-          }
-          const send = await livechatPost('/agent/action/send_event', {
-            chat_id: chatId,
-            event: { type: 'message', text: String(reply || 'Siap bosku!'), recipients: 'all' }
-          }, {});
-          if (!send.ok) console.warn('Webhook reply failed:', send.error, send.status);
-        }
-      } catch (e) {
-        console.warn('incoming_event handler error:', e.message);
-      }
-    }
-
-  // Acknowledge quickly to avoid retries
-  return res.sendStatus(200);
-  } catch (e) {
-    console.error('Webhook error:', e.message);
-    return res.sendStatus(200);
-  }
-});
 app.post('/settings', (req, res) => {
   const { brandName, welcomeMessage, waitMessage, endMessage } = req.body;
   if (!brandName || !welcomeMessage || !waitMessage || !endMessage) {
@@ -1123,6 +996,12 @@ app.get('/ai-capabilities', (req, res) => {
       supportedPlans: ['EXTEND', 'UPGRADE', 'DOWNGRADE']
     }
   });
+});
+
+// Add request logging middleware
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+  next();
 });
 
 // Error handling middleware
