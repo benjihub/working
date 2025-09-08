@@ -22,12 +22,8 @@
   </head>
   <body>
     <header>
-      <div class="wrap" style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+      <div class="wrap">
         <strong>GoodCasino Bot Chat</strong>
-        <div style="display:flex;gap:8px;align-items:center;">
-          <input id="secret" type="password" placeholder="BOT_SECRET (optional)" style="width:220px;padding:8px;border-radius:8px;border:1px solid #1f2937;background:#0b1220;color:#e2e8f0;" />
-          <button id="saveSecret" style="background:#374151">Save</button>
-        </div>
       </div>
     </header>
     <div class="wrap">
@@ -36,14 +32,19 @@
         <input id="msg" type="text" placeholder="Type a message and press Enter..." />
         <button id="send">Send</button>
       </div>
-      <footer>Tip: This talks to /api/bot/chat locally. Set BOT_SECRET and include x-bot-secret header here if you configured one.</footer>
+  <footer>Tip: This uses your local server. When hosted on localhost it uses same-origin; if opened from file:// it falls back to http://localhost:3002. Set BOT_SECRET via sessionStorage to include x-bot-secret if configured.</footer>
     </div>
     <script>
-      const elChat = document.getElementById('chat');
+  const elChat = document.getElementById('chat');
       const elMsg = document.getElementById('msg');
       const elSend = document.getElementById('send');
       const chatId = 'webui_' + Date.now();
       let busy = false;
+
+  // Prefer same-origin for any http(s) host (localhost, 127.0.0.1, or LAN IP). If opened from file://, fallback to localhost:3002
+  const LOCAL_ORIGIN = 'http://localhost:3002';
+  const isHttp = typeof location !== 'undefined' && /^https?:$/.test(location.protocol);
+  const API_BASE = isHttp ? '' : LOCAL_ORIGIN;
 
       function addBubble(text, who){
         const div = document.createElement('div');
@@ -53,33 +54,6 @@
         elChat.scrollTop = elChat.scrollHeight;
       }
 
-      // Utils: read query params
-      function getQueryParam(name){
-        const url = new URL(window.location.href);
-        return url.searchParams.get(name);
-      }
-
-      // Initialize BOT_SECRET from sessionStorage or ?secret=
-      const initialSecret = sessionStorage.getItem('BOT_SECRET') || getQueryParam('secret') || '';
-      if (initialSecret) {
-        sessionStorage.setItem('BOT_SECRET', initialSecret);
-      }
-
-      // Prefill the input (masking is handled by password field)
-      document.getElementById('secret').value = initialSecret;
-
-      // Save button handler
-      document.getElementById('saveSecret').addEventListener('click', () => {
-        const v = document.getElementById('secret').value.trim();
-        if (v) {
-          sessionStorage.setItem('BOT_SECRET', v);
-          addBubble('Secret saved in this tab.', 'bot');
-        } else {
-          sessionStorage.removeItem('BOT_SECRET');
-          addBubble('Secret cleared.', 'bot');
-        }
-      });
-
       async function send(){
         if(busy) return; busy = true; elSend.disabled = true;
         const text = elMsg.value.trim();
@@ -88,7 +62,7 @@
         elMsg.value = '';
         try {
           const secret = sessionStorage.getItem('BOT_SECRET') || '';
-          const resp = await fetch('/api/bot/chat', {
+          const resp = await fetch(`${API_BASE}/api/bot/chat`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -99,12 +73,11 @@
           const ct = resp.headers.get('content-type') || '';
           if (!ct.includes('application/json')) {
             const txt = await resp.text();
-            addBubble('Error: ' + (txt || (resp.status + ' ' + resp.statusText)), 'bot');
+            addBubble('Error: ' + (txt || resp.status + ' ' + resp.statusText), 'bot');
           } else {
             const data = await resp.json();
             if(!data.success){
-              const hint = resp.status === 401 ? ' (tip: set BOT_SECRET via the field above or ?secret=)' : '';
-              addBubble('Error: ' + (data.error || resp.statusText) + hint, 'bot');
+              addBubble('Error: ' + (data.error || resp.statusText), 'bot');
             } else {
               addBubble(String(data.reply || ''), 'bot');
             }

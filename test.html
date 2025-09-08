@@ -1,54 +1,106 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LiveChat Widget Test</title>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Server Status & LiveChat Test</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; line-height: 1.45; padding: 24px; }
+    .ok { color: #0a7d00; font-weight: 600; }
+    .fail { color: #b00020; font-weight: 600; }
+    code { background: #f4f4f4; padding: 2px 6px; border-radius: 4px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; margin: 16px 0; }
+    button { padding: 8px 12px; border-radius: 6px; border: 1px solid #d1d5db; background: #fff; cursor: pointer; }
+    button:hover { background: #f9fafb; }
+    ul { margin-top: 8px; }
+  </style>
 </head>
 <body>
-    <!-- LiveChat widget -->
-<!-- Start of LiveChat (www.livechat.com) code -->
-<script>
+  <h1>Server Status & LiveChat Test</h1>
+  <div class="card">
+    <p>
+      Base URL: <code id="baseUrl"></code>
+    </p>
+    <p>
+      This page will check if your server is running and reachable from this domain.
+      Open it via your VM domain (e.g., <code>https://your-domain.com/test.html</code>)
+      or locally via <code>http://localhost:3002/test.html</code>.
+    </p>
+    <button id="runChecks">Run checks</button>
+    <ul id="results">
+      <li id="check-webhook">GET /livechat/webhook …</li>
+      <li id="check-bot">GET /api/bot/health …</li>
+    </ul>
+  </div>
+
+  <!-- LiveChat widget embed -->
+  <script>
     window.__lc = window.__lc || {};
-    window.__lc.license = 19291328;
-    window.__lc.integration_name = "manual_onboarding";
-    window.__lc.product_name = "livechat";
-    ;(function(n,t,c){function i(n){return e._h?e._h.apply(null,n):e._q.push(n)}var e={_q:[],_h:null,_v:"2.0",on:function(){i(["on",c.call(arguments)])},once:function(){i(["once",c.call(arguments)])},off:function(){i(["off",c.call(arguments)])},get:function(){if(!e._h)throw new Error("[LiveChatWidget] You can't use getters before load.");return i(["get",c.call(arguments)])},call:function(){i(["call",c.call(arguments)])},init:function(){var n=t.createElement("script");n.async=!0,n.type="text/javascript",n.src="https://cdn.livechatinc.com/tracking.js",t.head.appendChild(n)}};!n.__lc.asyncInit&&e.init(),n.LiveChatWidget=n.LiveChatWidget||e}(window,document,[].slice))
-</script>
-<noscript><a href="https://www.livechat.com/chat-with/19291328/" rel="nofollow">Chat with us</a>, powered by <a href="https://www.livechat.com/?welcome" rel="noopener nofollow" target="_blank">LiveChat</a></noscript>
-<!-- End of LiveChat code -->
+    window.__lc.license = 19291328; // 👈 replace with your LiveChat license ID
+    (function(n,t,c){
+      function i(n){return e._h?e._h.apply(null,n):e._q.push(n)}
+      var e={_q:[],_h:null,_v:"2.0",
+      on:function(){i(["on",c.call(arguments)])},
+      once:function(){i(["once",c.call(arguments)])},
+      off:function(){i(["off",c.call(arguments)])},
+      get:function(){if(!e._h)throw new Error("[LiveChatWidget] You can't use getters before load.");
+      return i(["get",c.call(arguments)])},
+      call:function(){i(["call",c.call(arguments)])},
+      init:function(){var n=t.createElement("script");
+      n.async=!0,n.type="text/javascript",
+      n.src="https://cdn.livechatinc.com/tracking.js",t.head.appendChild(n)}};
+      !n.__lc.asyncInit&&e.init(),n.LiveChatWidget=n.LiveChatWidget||e
+    }(window,document,[].slice));
+  </script>
+  <noscript>
+    <a href="https://www.livechat.com/chat-with/19291328" rel="nofollow">Chat with us</a>
+    powered by <a href="https://www.livechat.com/?welcome" rel="noopener nofollow" target="_blank">LiveChat</a>
+  </noscript>
 
-<!-- Bot bridge: forward visitor messages to your server -->
-<script>
-    // 1) Set your server endpoint (adjust port/domain as needed)
-    window.__BOT_ENDPOINT__ = 'https://livechat-pfxb.onrender.com/send-message';
-    // 2) Shared secret to protect your API (also set BOT_SECRET in your server .env)
-    window.__BOT_SECRET__ = 'x-bot-secret';
-
-    // LiveChat widget API hook (legacy LC_API style)
-    window.LC_API = window.LC_API || {};
-    window.LC_API.on_message = function (payload) {
-        try {
-            if (!payload || payload.author_type !== 'visitor') return;
-            var text = payload.text || payload.message || '';
-            if (!text) return;
-            var chatId = (window.LC_API.get_chat_id && window.LC_API.get_chat_id()) || payload.chat_id || null;
-            if (!chatId) {
-                console.warn('[bot-bridge] Missing chatId. Payload was:', payload);
-                return;
-            }
-            var userId = (payload.user_id || payload.id || 'visitor');
-            fetch(window.__BOT_ENDPOINT__, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'x-bot-secret': window.__BOT_SECRET__ },
-                body: JSON.stringify({ chatId: chatId, message: text, userId: userId })
-            }).catch(function (e) { console.warn('[bot-bridge] forward failed', e); });
-        } catch (e) {
-            console.warn('[bot-bridge] error', e);
-        }
+  <script>
+    const baseEl = document.getElementById('baseUrl');
+    const results = {
+      webhook: document.getElementById('check-webhook'),
+      bot: document.getElementById('check-bot')
     };
-</script>
+    const btn = document.getElementById('runChecks');
 
+    function setStatus(el, ok, detail) {
+      el.className = ok ? 'ok' : 'fail';
+      el.textContent = `${el.dataset.label} ${ok ? '✓ OK' : '✗ FAIL'}${detail ? ' — ' + detail : ''}`;
+    }
 
+    async function check() {
+      const base = window.location.origin;
+      baseEl.textContent = base;
+
+      // Reset
+      results.webhook.dataset.label = 'GET /livechat/webhook';
+      results.bot.dataset.label = 'GET /api/bot/health';
+      results.webhook.className = results.bot.className = '';
+      results.webhook.textContent = 'GET /livechat/webhook …';
+      results.bot.textContent = 'GET /api/bot/health …';
+
+      try {
+        const r1 = await fetch(base + '/livechat/webhook', { method: 'GET' });
+        const j1 = await r1.json().catch(() => ({}));
+        setStatus(results.webhook, r1.ok && (j1.status === 'ok'), `status=${r1.status}`);
+      } catch (e) {
+        setStatus(results.webhook, false, e.message);
+      }
+
+      try {
+        const r2 = await fetch(base + '/api/bot/health', { method: 'GET' });
+        const j2 = await r2.json().catch(() => ({}));
+        setStatus(results.bot, r2.ok && (j2.status === 'ok'), `status=${r2.status}`);
+      } catch (e) {
+        setStatus(results.bot, false, e.message);
+      }
+    }
+
+    btn.addEventListener('click', check);
+    // auto-run on load
+    window.addEventListener('DOMContentLoaded', check);
+  </script>
 </body>
 </html>
