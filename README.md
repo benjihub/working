@@ -127,4 +127,4 @@ git push -u origin main
 
 ## Security
 - Never commit `.env` or real secrets. Use `.env.example` only as a template.
-- Use a strong `LIVECHAT_WEBHOOK_SECRET` and rotate if exposed.
+- Use a strong `LIVECHAT_WEBHOOK_SECRET` and rotate if exposed.# working
