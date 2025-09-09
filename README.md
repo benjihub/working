@@ -52,11 +52,79 @@ If you previously registered other URLs, remove duplicates with: npm run webhook
 - Webhook spam: cooldown is controlled by LIVECHAT_REPLY_COOLDOWN_MS, and dedup is enabled.
 
 ## GitHub quick start
+# GoodCasino LiveChat Bot (Node/Express)
+
+Production-ready Node.js + Express server integrated with LiveChat webhooks. Includes:
+- Webhook handler with secret validation, duplicate suppression, customer-only filter, and per-chat cooldown
+- Helper to send replies via LiveChat Agent Chat API (PAT Basic auth)
+- CLI tools to register/list/delete webhooks
+- Test page `test.html` with server status checks and LiveChat widget
+
+## Quick start (local)
+1) Install deps
+```
+npm install
+```
+2) Copy env
+```
+cp .env.example .env
+```
+3) Edit `.env` (set LIVECHAT_PAT as base64 account_id:PAT, set LIVECHAT_WEBHOOK_SECRET)
+4) Run
+```
+npm run server
+```
+5) Open http://localhost:3002/test.html
+
+## Webhooks
+- Register: `npm run webhooks:register`
+- List: `npm run webhooks:list`
+- Delete: `npm run webhooks:delete -- <webhook_id>`
+
+## Deploy to Render (recommended)
+This repo includes a `render.yaml` for one-click deploy.
+
+### Steps
+1) Push to GitHub (see below)
+2) On Render, create a new Web Service from your repo
+	- Build Command: `npm install`
+	- Start Command: `node server.js`
+	- Port: Render supplies `PORT` automatically (render.yaml sets 10000 as default; Render overrides it)
+3) Set environment variables in Render Dashboard:
+	- LIVECHAT_CLIENT_ID
+	- LIVECHAT_PAT (base64 account_id:PAT)
+	- LIVECHAT_WEBHOOK_URL = https://<your-render-url>/livechat/webhook
+	- LIVECHAT_WEBHOOK_SECRET = strong_random_string
+	- LIVECHAT_REPLY_COOLDOWN_MS = 5000
+	- BOT_SECRET (optional)
+	- USE_OPENAI / OPENAI_API_KEY (optional)
+4) Deploy
+5) Register the webhook from the Render shell or locally:
+```
+npm run webhooks:register
+```
+6) Remove duplicates:
+```
+npm run webhooks:list
+npm run webhooks:delete -- <id>
+```
+
+## Push to GitHub
 ```
 git init
 git add .
-git commit -m "init"
+git commit -m "deploy: render setup"
 git branch -M main
-git remote add origin https://github.com/<you>/<repo>.git
+git remote add origin https://github.com/<your-username>/<repo>.git
 git push -u origin main
 ```
+
+## Endpoints
+- GET `/livechat/webhook` – health
+- POST `/livechat/webhook` – LiveChat webhook (expects secret)
+- GET `/api/bot/health` – bot health
+- POST `/api/livechat/send/:chatId` – send message (requires BOT_SECRET if set)
+
+## Security
+- Never commit `.env` or real secrets. Use `.env.example` only as a template.
+- Use a strong `LIVECHAT_WEBHOOK_SECRET` and rotate if exposed.
