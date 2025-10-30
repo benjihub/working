@@ -1,8 +1,15 @@
 // listWebhooks.js
 // List registered webhooks across versions using available auth variants
-require('dotenv').config();
+require('dotenv').config({ override: true });
 const axios = require('axios');
 const { getHeaderVariants } = require('./livechatAuth');
+
+const clientId = process.env.LIVECHAT_CLIENT_ID || '';
+
+if (!clientId) {
+  console.error('LIVECHAT_CLIENT_ID is required to list webhooks');
+  process.exit(1);
+}
 
 (async () => {
   const headerVariants = getHeaderVariants();
@@ -18,7 +25,8 @@ const { getHeaderVariants } = require('./livechatAuth');
   for (const ep of endpoints) {
     for (const variant of headerVariants) {
       try {
-        const { data, status } = await axios.post(ep.url, {}, { headers: { ...variant, Accept: 'application/json' }, timeout: 15000 });
+  const payload = { owner_client_id: clientId };
+  const { data, status } = await axios.post(ep.url, payload, { headers: { ...variant, Accept: 'application/json' }, timeout: 15000 });
         const variantName = Object.values(variant)[0]?.toString().startsWith('Basic') ? 'Basic' : 'Bearer';
         console.log(`List webhooks via ${ep.label} using ${variantName} (status ${status})`);
         console.dir(data, { depth: 6 });

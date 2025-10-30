@@ -1,0 +1,77 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Group Payments Settings</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; margin: 20px; }
+    label { display:block; margin-top:10px; font-weight:600 }
+    textarea, input[type=text] { width: 100%; box-sizing: border-box; }
+    .inline { display:inline-block; vertical-align:middle }
+    .small { width: 200px }
+    .btn { padding: 8px 12px; margin-top:12px }
+    #msg { margin-top:12px }
+  </style>
+</head>
+<body>
+  <h2>Group Payments Settings</h2>
+  <p>Enter group id in URL as <code>?gid=123</code>. You must be logged in (Master/Owner) to save.</p>
+
+  <label>Bank list (one per line)</label>
+  <textarea id="banks" rows="6" placeholder="BCA\nBNI\nBRI"></textarea>
+
+  <label>E-Wallet list (one per line)</label>
+  <textarea id="ewallets" rows="4" placeholder="Gopay\nDana"></textarea>
+
+  <label>
+    <input type="checkbox" id="qris" /> QRIS available
+  </label>
+
+  <button id="save" class="btn">Save</button>
+  <span id="msg"></span>
+
+<script>
+(async function(){
+  function qs(sel){ return document.querySelector(sel); }
+  const params = new URLSearchParams(location.search);
+  const gid = params.get('gid');
+  const msg = qs('#msg');
+  if (!gid) { msg.innerText = 'Please supply ?gid=GROUP_ID in the URL'; qs('#save').disabled = true; return; }
+
+  async function load() {
+    try {
+      const r = await fetch(`/api/groups/${gid}/payments`, { credentials: 'same-origin' });
+      if (!r.ok) throw new Error('Failed to load: ' + r.status);
+      const j = await r.json();
+      if (j && j.payments) {
+        const p = j.payments;
+        qs('#banks').value = (p.banks || p.BANKS || []).join('\n');
+        qs('#ewallets').value = (p.ewallets || p.E_WALLET || p.e_wallet || []).join('\n');
+        qs('#qris').checked = Boolean(p.qris || p.QRIS || p.qr || false);
+        msg.innerText = 'Loaded settings';
+      } else {
+        msg.innerText = 'No payments settings set for this group (defaults will apply).';
+      }
+    } catch (e) { msg.innerText = 'Error loading: ' + (e.message || e); }
+  }
+
+  async function save() {
+    try {
+      const banks = qs('#banks').value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+      const ewallets = qs('#ewallets').value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+      const qris = qs('#qris').checked;
+      const payload = { payments: { banks: banks, ewallets: ewallets, qris: qris } };
+      msg.innerText = 'Saving...';
+      const r = await fetch(`/api/groups/${gid}/payments`, { method: 'PUT', credentials: 'same-origin', headers: { 'Content-Type':'application/json' }, body: JSON.stringify(payload) });
+      const j = await r.json();
+      if (!r.ok || !j.success) throw new Error((j && j.error) ? j.error : ('HTTP ' + r.status));
+      msg.innerText = 'Saved';
+    } catch (e) { msg.innerText = 'Save error: ' + (e.message || e); }
+  }
+
+  qs('#save').addEventListener('click', save);
+  load();
+})();
+</script>
+</body>
+</html>

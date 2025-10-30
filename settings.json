@@ -1,0 +1,15 @@
+{
+  "brandName": "VIP sec 45",
+  "welcomeMessage": "Halo you bosku? 😊😘",
+  "waitMessage": "Alright boss, please wait while we check this for you 😊",
+  "endMessage": "Thank you boss, we wish you good luck! 😘",
+  "minDeposit": 4000,
+  "maxDeposit": 500000,
+  "minWithdrawal": 4000,
+  "maxWithdrawal": 100000,
+  "paymentOptions": {
+    "banks": ["BCA", "BNI", "BRI"],
+    "eWallets": ["Gopay", "Dana"],
+    "qris": true
+  }
+}

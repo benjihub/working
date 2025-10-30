@@ -1,47 +1,65 @@
-// livechatApi.js
-// Helper to send messages via LiveChat API with robust auth fallbacks (Basic preferred)
 const axios = require('axios');
 const { getHeaderVariants } = require('./livechatAuth');
 
-async function sendMessage(chatId, text) {
+// Minimal LiveChat API wrapper used by livechat-group-helpers.js
+// Exports: sendMessage(chatId, message, payload)
+// - If payload.typing === true/false, calls send_typing_indicator
+// - Otherwise calls send_event to post a chat message
+
+async function postWithVariants(path, body, { timeout = 15000 } = {}) {
   const headerVariants = getHeaderVariants();
   if (!headerVariants || headerVariants.length === 0) {
-    throw new Error('LiveChat credentials not set (LIVECHAT_USERNAME/PASSWORD, LIVECHAT_PAT, or LIVECHAT_ACCESS_TOKEN)');
+    throw new Error('LiveChat credentials not configured');
   }
+  let lastErr = null;
+  for (const headers of headerVariants) {
+    try {
+      const { data } = await axios.post(`https://api.livechatinc.com/v3.5${path}`, body, { headers: { ...headers, 'Content-Type': 'application/json', Accept: 'application/json' }, timeout });
+      return { ok: true, data };
+    } catch (error) {
+      lastErr = error;
+      const status = error.response?.status;
+      if (status === 401 || status === 403) {
+        // try next header variant
+        continue;
+      }
+      // non-auth error: stop trying
+      break;
+    }
+  }
+  const msg = lastErr?.response?.data || lastErr?.message || 'Unknown error';
+  return { ok: false, error: msg, status: lastErr?.response?.status || 500, raw: lastErr?.response?.data };
+}
 
+async function sendTypingIndicator(chatId, isTyping, visibility = 'all') {
+  try {
+    const body = { chat_id: chatId, is_typing: !!isTyping, visibility };
+    return await postWithVariants('/agent/action/send_typing_indicator', body, { timeout: 7000 });
+  } catch (e) {
+    return { ok: false, error: e?.message || e };
+  }
+}
+
+async function sendEventMessage(chatId, text, payload = {}) {
   const body = {
     chat_id: chatId,
     event: {
       type: 'message',
-      text: text,
-      recipients: 'all'
+      text: text || '',
+      recipients: payload.recipients || 'all'
     }
   };
-
-  const apiVersions = ['v3.6', 'v3.5'];
-  let lastErr = null;
-  for (const ver of apiVersions) {
-    for (const headers of headerVariants) {
-      try {
-        const res = await axios.post(`https://api.livechatinc.com/${ver}/agent/action/send_event`, body, {
-          headers: { ...headers, 'Content-Type': 'application/json', Accept: 'application/json' },
-          timeout: 15000
-        });
-        return res.data;
-      } catch (err) {
-        lastErr = err;
-        const status = err.response?.status;
-        // On auth or not found, try next header/version; on other errors, break out of headers loop
-        if (status === 401 || status === 403 || status === 404) {
-          continue;
-        }
-        break;
-      }
-    }
-  }
-  const details = lastErr?.response?.data || lastErr?.message || 'Unknown error';
-  console.error('LiveChat sendMessage error:', details);
-  throw lastErr || new Error('Failed to send message to LiveChat');
+  return await postWithVariants('/agent/action/send_event', body, {});
 }
 
-module.exports = { sendMessage };
+module.exports = {
+  sendMessage: async function (chatId, message, payload = {}) {
+    if (!chatId) throw new Error('chatId required');
+    // Typing indicator path
+    if (payload && Object.prototype.hasOwnProperty.call(payload, 'typing')) {
+      return await sendTypingIndicator(chatId, !!payload.typing, payload.visibility || 'all');
+    }
+    // Normal message
+    return await sendEventMessage(chatId, message, payload);
+  }
+};

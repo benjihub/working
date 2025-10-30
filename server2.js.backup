@@ -1,0 +1,4193 @@
+// server.js
+// Express server for LiveChat + local APIs
+require('dotenv').config({ override: true });
+const express = require('express');
+const bodyParser = require('body-parser');
+const axios = require('axios');
+const crypto = require('crypto');
+const { extractGroupId, mapChatToGroup, sendReply } = require('./livechat-group-helpers.js');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs').promises;
+const dbUtils = require('./db-utils.js');
+
+// Simple real-time updates (no WebSockets needed!)
+const { setupSimpleUpdates, integrateWithWebhook } = require('./ultra-simple-updates.js');
+
+// Agent Chat API for efficient bubble detection and responses
+const { AgentChatManager } = require('./agent-chat-manager.js');
+
+// SSE LiveChat Integration (alternative to webhooks) - DISABLED: file removed during cleanup
+// const { LiveChatSSEManager } = require('./livechat-sse-connector.js');
+
+// Initialize Agent Chat Manager
+const agentChatManager = new AgentChatManager();
+
+// Initialize SSE Manager (optional, can be enabled via env var)
+let liveChatSSE = null;
+// SSE mode disabled - file removed during cleanup
+// if (process.env.ENABLE_LIVECHAT_SSE === 'true') {
+//   liveChatSSE = new LiveChatSSEManager();
+//   console.log('🔌 LiveChat SSE mode enabled');
+// }
+const {
+  getDb,
+  getChatState,
+  updateChatState,
+  setChatStatus,
+  getChatStatus,
+  getChatStatusMap,
+  addMessage,
+  getChatMessages,
+  getChatGroup,
+  getGlobalAutoAiState,
+  setGlobalAutoAiState,
+  getLastCustomerEventId,
+  updateLastCustomerEventId,
+  getGroupLivechatGroupId
+} = dbUtils;
+let db;
+
+if (!global.__globalAutoAiState) {
+  global.__globalAutoAiState = {
+    enabled: false,
+    lockedByUserId: null,
+    lockedByEmail: null,
+    lockedByRole: null,
+    lockedScope: null,
+    lockedAt: null
+  };
+}
+
+// Global Auto AI: Track processed events to prevent duplicates
+const _processedAutoAiEvents = new Map(); // chatId -> Set(eventIds)
+const MAX_CACHE_SIZE = 1000; // Prevent memory leak
+
+function hasProcessedAutoAiEvent(chatId, eventId) {
+  const events = _processedAutoAiEvents.get(chatId);
+  return events && events.has(eventId);
+}
+
+function markAutoAiEventProcessed(chatId, eventId) {
+  if (!_processedAutoAiEvents.has(chatId)) {
+    _processedAutoAiEvents.set(chatId, new Set());
+  }
+  _processedAutoAiEvents.get(chatId).add(eventId);
+  
+  // Clean up old entries if cache gets too large
+  if (_processedAutoAiEvents.size > MAX_CACHE_SIZE) {
+    const firstKey = _processedAutoAiEvents.keys().next().value;
+    _processedAutoAiEvents.delete(firstKey);
+  }
+}
+
+function normalizeEventTimestamp(ts) {
+  if (ts == null) return '';
+  if (typeof ts === 'number') {
+    if (ts > 1e12) return new Date(ts).toISOString();
+    if (ts > 1e9) return new Date(ts * 1000).toISOString();
+    return String(ts);
+  }
+  const str = String(ts).trim();
+  if (!str) return '';
+  const parsed = new Date(str);
+  if (!Number.isNaN(parsed.getTime())) return parsed.toISOString();
+  return str;
+}
+
+function buildEventIdentity(chatId, eventId, { text = '', authorId = null, createdAt = null } = {}) {
+  const normalizedText = (text == null ? '' : String(text));
+  const trimmedText = normalizedText.trim();
+  const ts = normalizeEventTimestamp(createdAt);
+  const rawId = eventId != null && String(eventId).trim() !== '' ? String(eventId).trim() : null;
+  const fallbackIdBase = `${ts}|${authorId != null ? String(authorId).trim() : ''}|${normalizedText.slice(0, 25)}`;
+  const normalizedEventId = rawId || (fallbackIdBase && fallbackIdBase.trim() !== '' ? fallbackIdBase : `anon:${chatId || ''}:${trimmedText.slice(0, 50)}`);
+  const fingerprintSource = [chatId || 'unknown', normalizedEventId, trimmedText.slice(0, 120)].join('||');
+  const fingerprint = crypto.createHash('sha1').update(fingerprintSource).digest('hex');
+  return { normalizedEventId, fingerprint };
+}
+
+function normalizeCustomerText(text) {
+  if (text == null) return '';
+  return String(text)
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function normalizeAuthorId(authorId) {
+  if (authorId == null || authorId === '') return 'anon';
+  return String(authorId).trim().toLowerCase();
+}
+
+function buildCustomerMessageSignature(chatId, text, authorId) {
+  const normalizedText = normalizeCustomerText(text);
+  const normalizedAuthor = normalizeAuthorId(authorId);
+  const source = [chatId || 'unknown', normalizedAuthor, normalizedText].join('||');
+  const signature = crypto.createHash('sha1').update(source).digest('hex');
+  return {
+    signature,
+    normalizedText,
+    normalizedAuthor
+  };
+}
+
+// Initialize database
+const initializeDatabase = async () => {
+  try {
+    db = await dbUtils.initDb();
+    console.log('✅ Database initialized successfully');
+  } catch (error) {
+    console.error('❌ Failed to initialize database:', error);
+    process.exit(1);
+  }
+};
+
+// Import the smart payment AI
+const smartPaymentAI = require('./smart-payment-ai.js');
+const { 
+  getSmartResponse, 
+  detectOffTopic,
+  extractCID,
+  extractPlanType,
+  extractCurrencyPreference,
+  PAYMENT_STATES,
+  PAYMENT_TEMPLATES
+} = smartPaymentAI;
+const getPaymentChatState = smartPaymentAI.getChatState;
+
+// Import GoodCasino bot functions for local chat API
+const {
+  getCustomerServiceResponse: gcGetResponse,
+  getChatState: gcGetChatState
+} = require('./newtest3.js');
+
+const app = express();
+const auth = require('./auth.js');
+const INITIAL_PORT = parseInt(process.env.PORT || '3002', 10);
+const HOST = '0.0.0.0';
+
+// Global server instance
+let serverInstance = null;
+let activePort = INITIAL_PORT;
+
+// In-memory deduplication for webhook events (prevent spam on duplicates)
+const processedEvents = new Map(); // id -> timestamp
+function isDuplicateEvent(eventId, ttlMs = 5 * 60 * 1000) {
+  if (!eventId) return false;
+  const now = Date.now();
+  const prev = processedEvents.get(eventId);
+  if (prev && now - prev < ttlMs) return true;
+  processedEvents.set(eventId, now);
+  // occasional prune
+  if (processedEvents.size > 5000) {
+    const cutoff = now - ttlMs;
+    for (const [id, ts] of processedEvents) {
+      if (ts < cutoff) processedEvents.delete(id);
+    }
+  }
+  return false;
+}
+
+function removeDuplicateEvent(eventId) {
+  if (!eventId) return;
+  processedEvents.delete(eventId);
+}
+
+if (!global.__handledMessagesByChat) {
+  global.__handledMessagesByChat = new Map();
+}
+
+function clearHandledMessage(chatId, signature) {
+  if (!chatId || !signature) return;
+  const map = global.__handledMessagesByChat;
+  const entries = map.get(chatId);
+  if (!entries) return;
+  entries.delete(signature);
+  if (entries.size === 0) {
+    map.delete(chatId);
+  }
+}
+
+function markHandledMessage(chatId, signature) {
+  if (!chatId || !signature) return;
+  const map = global.__handledMessagesByChat;
+  let entries = map.get(chatId);
+  if (!entries) {
+    entries = new Set();
+    map.set(chatId, entries);
+  }
+  entries.add(signature);
+}
+
+function hasHandledMessage(chatId, signature) {
+  if (!chatId || !signature) return false;
+  const map = global.__handledMessagesByChat;
+  const entries = map.get(chatId);
+  return entries ? entries.has(signature) : false;
+}
+
+function buildMessageSignature(chatId, eventId, text) {
+  return [chatId || 'unknown', eventId || 'none', (text || '').trim().slice(0, 120)].join('::');
+}
+
+const ASSISTANT_DUP_TTL_MS = parseInt(process.env.ASSISTANT_DUP_TTL_MS || '60000', 10);
+if (!global.__recentAssistantMessages) {
+  global.__recentAssistantMessages = new Map();
+}
+
+// Global Auto AI: Request-level locking to prevent concurrent processing duplicates
+if (!global.__activeChatLocks) {
+  global.__activeChatLocks = new Set();
+}
+const activeChatLocks = global.__activeChatLocks;
+
+function normalizeAssistantText(text) {
+  return (text || '').toString().trim();
+}
+
+function shouldSkipAssistantMessage(chatId, text, { senderId = null } = {}, ttlMs = ASSISTANT_DUP_TTL_MS) {
+  if (!chatId) return false;
+  const normalized = normalizeAssistantText(text);
+  if (!normalized) return false;
+
+  const counts = global.__messageCountsByChat?.get(chatId);
+  if (counts) {
+    const maxPerUser = Math.max(1, parseInt(process.env.ASSISTANT_MAX_PER_USER_MESSAGE || '1', 10));
+    const assistantSinceUser = counts.assistantSinceUser || 0;
+    const lastUserAt = counts.lastUserAt || 0;
+    const lastAssistantAt = counts.lastAssistantAt || 0;
+    if (lastUserAt > 0 && lastAssistantAt >= lastUserAt && assistantSinceUser >= maxPerUser) {
+      console.log(`🚫 Assistant limit reached for chat ${chatId} (since last user message: ${assistantSinceUser}/${maxPerUser}).`);
+      return true;
+    }
+  }
+
+  const map = global.__recentAssistantMessages;
+  const entry = map.get(chatId);
+  if (!entry) return false;
+
+  const now = Date.now();
+
+  if (entry.text === normalized) {
+    if (!entry.by || !senderId || entry.by === senderId) {
+      console.log(`🚫 Duplicate assistant text detected for chat ${chatId}, blocking resend.`);
+      return true;
+    }
+  }
+
+  const RATE_LIMIT_MS = 5000;
+  if (now - entry.at < RATE_LIMIT_MS) {
+    console.log(`🚫 Rate limiting assistant message (too soon): ${now - entry.at}ms since last message`);
+    return true;
+  }
+
+  if (now - entry.at > ttlMs) {
+    map.delete(chatId);
+    return false;
+  }
+
+  return false;
+}
+
+function rememberAssistantMessage(chatId, text, { senderId = null } = {}) {
+  if (!chatId) return;
+  const normalized = normalizeAssistantText(text);
+  if (!normalized) return;
+  global.__recentAssistantMessages.set(chatId, { text: normalized, at: Date.now(), by: senderId || null });
+}
+
+if (!global.__messageCountsByChat) {
+  global.__messageCountsByChat = new Map();
+}
+
+function trackMessage(chatId, role) {
+  if (!chatId || (role !== 'user' && role !== 'assistant')) return;
+  let counts = global.__messageCountsByChat.get(chatId);
+  if (!counts) {
+    counts = {
+      user: 0,
+      assistant: 0,
+      assistantSinceUser: 0,
+      lastUserAt: 0,
+      lastAssistantAt: 0,
+      lastRole: null,
+      lastAt: 0
+    };
+    global.__messageCountsByChat.set(chatId, counts);
+  }
+
+  const now = Date.now();
+  if (role === 'user') {
+    counts.user = (counts.user || 0) + 1;
+    counts.lastUserAt = now;
+    counts.assistantSinceUser = 0;
+  } else {
+    counts.assistant = (counts.assistant || 0) + 1;
+    counts.lastAssistantAt = now;
+    const lastUserAt = counts.lastUserAt || 0;
+    if (!lastUserAt || now <= lastUserAt) {
+      counts.assistantSinceUser = Math.max(1, counts.assistantSinceUser || 0);
+    } else {
+      counts.assistantSinceUser = (counts.assistantSinceUser || 0) + 1;
+    }
+  }
+  counts.lastRole = role;
+  counts.lastAt = now;
+
+  if (global.__messageCountsByChat.size > 1000) {
+    const keep = 800;
+    let removed = 0;
+    for (const key of global.__messageCountsByChat.keys()) {
+      if (removed >= (global.__messageCountsByChat.size - keep)) break;
+      global.__messageCountsByChat.delete(key);
+      removed++;
+    }
+  }
+}
+
+function hasExceededMessageRatio(chatId) {
+  if (!chatId) return false;
+  const counts = global.__messageCountsByChat.get(chatId);
+  if (!counts || counts.user === 0) return false;
+  if (counts.user <= 3) return false;
+  return counts.assistant >= counts.user;
+}
+
+function parseEnvList(key, fallback = '') {
+  const raw = process.env[key];
+  if (raw == null || raw === '') return fallback.split(',').map((s) => s.trim()).filter(Boolean);
+  if (Array.isArray(raw)) return raw.map((s) => String(s).trim()).filter(Boolean);
+  return String(raw)
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function evaluateChatIdForSend(chatId, req, payload) {
+  const allowFake = String(process.env.ALLOW_FAKE_LIVECHAT_CHAT_IDS || '').toLowerCase() === 'true';
+  if (allowFake) {
+    return { skip: false, reason: null, match: null, allowFake };
+  }
+
+  const minLength = Math.max(4, parseInt(process.env.LIVECHAT_MIN_CHAT_ID_LENGTH || '4', 10) || 4);
+  const normalized = (chatId == null ? '' : String(chatId)).trim();
+  const lower = normalized.toLowerCase();
+
+  const headerFlag = String(req.headers['x-local-test'] || '').toLowerCase();
+  if (headerFlag === 'true') {
+    return { skip: true, reason: 'local_test_header', match: null, allowFake };
+  }
+
+  if (payload?.is_local_test === true || payload?.metadata?.is_local_test === true) {
+    return { skip: true, reason: 'local_test_flag', match: null, allowFake };
+  }
+
+  if (!normalized) {
+    return { skip: true, reason: 'missing_chat_id', match: null, allowFake };
+  }
+
+  if (lower.length < minLength) {
+    return { skip: true, reason: 'short_chat_id', match: lower.length, allowFake };
+  }
+
+  const prefixList = parseEnvList('LIVECHAT_FAKE_CHAT_ID_PREFIXES', 'test_,demo_,local_,sample_').map((p) => p.toLowerCase());
+  const matchingPrefix = prefixList.find((prefix) => prefix && lower.startsWith(prefix));
+  if (matchingPrefix) {
+    return { skip: true, reason: 'fake_prefix', match: matchingPrefix, allowFake };
+  }
+
+  const fakeExactList = parseEnvList('LIVECHAT_FAKE_CHAT_IDS', '').map((id) => id.toLowerCase());
+  if (fakeExactList.includes(lower)) {
+    return { skip: true, reason: 'fake_exact', match: lower, allowFake };
+  }
+
+  return { skip: false, reason: null, match: null, allowFake };
+}
+
+function matchSecretFromSignature(signatureHeader, rawBodyBuffer, allowedSecrets) {
+  if (!signatureHeader || !rawBodyBuffer || !allowedSecrets || allowedSecrets.size === 0) {
+    return null;
+  }
+  const headerParts = String(signatureHeader)
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (!headerParts.length) return null;
+
+  const headerLower = headerParts.map((part) => part.toLowerCase());
+  for (const secret of allowedSecrets) {
+    try {
+      const sha256Hex = crypto.createHmac('sha256', secret).update(rawBodyBuffer).digest('hex');
+      const sha256Base64 = crypto.createHmac('sha256', secret).update(rawBodyBuffer).digest('base64');
+      const sha1Hex = crypto.createHmac('sha1', secret).update(rawBodyBuffer).digest('hex');
+      const candidates = [
+        sha256Hex,
+        sha256Base64,
+        `sha256=${sha256Hex}`,
+        `sha256=${sha256Base64}`,
+        sha1Hex,
+        `sha1=${sha1Hex}`
+      ].map((val) => val.toLowerCase());
+
+      for (const hdr of headerLower) {
+        if (candidates.includes(hdr)) {
+          return secret;
+        }
+      }
+    } catch (err) {
+      console.warn('Non-fatal: failed computing webhook signature candidate', err?.message || err);
+    }
+  }
+  return null;
+}
+
+// Function to get server instance
+function getServerInstance() {
+  if (!serverInstance) {
+    throw new Error('Server not initialized');
+  }
+  return serverInstance;
+}
+
+// Function to start the server
+const startServer = async () => {
+  try {
+    await initializeDatabase();
+    try {
+      const initialAutoState = await getGlobalAutoAiState();
+      global.__globalAutoAiState = Object.assign({}, global.__globalAutoAiState, initialAutoState || {});
+    } catch (stateErr) {
+      console.warn('Unable to read initial Global Auto AI state:', stateErr?.message || stateErr);
+    }
+
+    // Webhook responder and Agent Chat Manager work together for auto-replies
+    agentChatManager.setAutoReplyEnabled(true);
+    
+    // Helper to attempt listening on a port and resolve/reject accordingly
+    const listenOnce = (port) => new Promise((resolve, reject) => {
+      const server = app.listen(port, () => resolve(server));
+      server.on('error', (err) => reject(err));
+    });
+
+    // Try initial port, then next two if busy (total up to 3 attempts)
+    let portToTry = INITIAL_PORT;
+    let attemptsLeft = 2;
+    while (true) {
+      try {
+        const server = await listenOnce(portToTry);
+        serverInstance = server;
+        activePort = portToTry;
+
+        const addressInfo = server.address();
+        let localUrl = `http://localhost:${portToTry}`;
+        let networkUrl = `http://${getLocalIpAddress()}:${portToTry}`;
+        if (addressInfo) {
+          if (typeof addressInfo === 'string') {
+            localUrl = addressInfo;
+            networkUrl = addressInfo;
+          } else if (typeof addressInfo === 'object' && addressInfo.port) {
+            localUrl = `http://localhost:${addressInfo.port}`;
+            networkUrl = `http://${getLocalIpAddress()}:${addressInfo.port}`;
+          }
+        }
+
+        console.log(`\n🚀 Server Details:`);
+        console.log(`   • Address: ${localUrl}`);
+        console.log(`   • Network: Accessible from other devices on the network`);
+        console.log(`   • Time: ${new Date().toISOString()}`);
+
+        console.log('\n🔍 Available Endpoints:');
+        console.log(`   • GET  /api/promotions - List all promotions`);
+        console.log(`   • POST /api/promotions - Add a new promotion`);
+        console.log(`   • PUT  /api/promotions/:id - Update a promotion`);
+        console.log(`   • DELETE /api/promotions/:id - Delete a promotion`);
+        console.log(`   • GET  /api/rtp - Get RTP link (JSON)`);
+        console.log(`   • PUT  /api/rtp - Update RTP link (persisted)`);
+        console.log(`   • POST /api/rtp - Get RTP link (JSON)`);
+        console.log(`   • GET  /api/trp - Alias RTP link (JSON)`);
+        console.log(`   • POST /api/trp - Alias RTP link (JSON)`);
+
+        console.log('\n✨ Server Features:');
+        console.log('   • Payment processing automation');
+        console.log('   • Real-time promotions management');
+        console.log('   • Smart AI response generation');
+        console.log('   • Bilingual support (EN/ID)');
+
+        console.log('\nServer is running on:');
+        console.log(`   - Local: ${localUrl}`);
+        console.log(`   - Network: ${networkUrl}`);
+        console.log('\n✨ Server is ready!');
+
+        if (String(process.env.DISABLE_LIVECHAT_WEBHOOK || '').toLowerCase() === 'true') {
+          console.warn('⚠️ LiveChat webhooks are disabled. Chats will not be processed until they are enabled.');
+        } else {
+          // Start Agent Chat Manager for bubble detection and responses
+          console.log('\n🤖 Starting Agent Chat Manager...');
+          agentChatManager.start();
+
+          // Start SSE LiveChat Manager if enabled
+          if (liveChatSSE) {
+            console.log('\n🔌 Starting LiveChat SSE Manager...');
+            liveChatSSE.startLiveChatPolling();
+            console.log('✅ SSE LiveChat integration active');
+            console.log('📡 AI can connect to: /api/livechat/sse');
+          } else {
+            console.log('ℹ️  SSE LiveChat integration disabled (set ENABLE_LIVECHAT_SSE=true to enable)');
+          }
+        }
+
+        // Also attach a generic error logger for runtime errors
+        server.on('error', (error) => {
+          console.error('\n❌ Server error:', error);
+        });
+        break; // success
+      } catch (error) {
+        if (error.code === 'EADDRINUSE' && attemptsLeft > 0) {
+          console.error(`\n❌ Port ${portToTry} in use. Retrying on ${portToTry + 1}...`);
+          portToTry += 1;
+          attemptsLeft -= 1;
+          continue;
+        }
+        if (error.code === 'EADDRINUSE') {
+          console.error(`\n❌ All attempted ports are in use starting from ${INITIAL_PORT}.`);
+          console.log('Please close the other application or set a free PORT in .env.');
+        } else {
+          console.error('\n❌ Failed to start server:', error);
+        }
+        process.exit(1);
+      }
+    }
+
+  } catch (error) {
+    console.error('❌ Failed to start server:', error);
+    process.exit(1);
+  }
+};
+
+// Start the server
+startServer().catch(error => {
+  console.error('❌ Failed to start server:', error);
+  process.exit(1);
+});
+
+// Track active users and open tickets
+const activeUsers = new Set();
+const openTickets = new Set();
+
+// Helper function to update chat activity
+async function updateChatActivity(chatId, userId) {
+  const now = Math.floor(Date.now() / 1000);
+  activeUsers.add(userId);
+  openTickets.add(chatId);
+
+  // Update last activity in the database (better-sqlite3 is synchronous)
+  try {
+    if (!db) {
+      // Lazy acquire if global not yet set (should normally be set by startServer)
+      db = await getDb();
+    }
+    db.prepare('INSERT OR IGNORE INTO chats (id, state, last_activity) VALUES (?, ?, ?)')
+      .run(chatId, '{}', now);
+    db.prepare('UPDATE chats SET last_activity = ? WHERE id = ?')
+      .run(now, chatId);
+  } catch (error) {
+    console.error('Error updating chat activity:', error);
+  }
+}
+
+app.use(cors({
+  origin: '*', // Allow all origins in development
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-bot-secret']
+}));
+const rawBodySaver = (req, res, buf) => {
+  if (Buffer.isBuffer(buf)) {
+    req.rawBody = Buffer.from(buf);
+  }
+};
+app.use(bodyParser.json({ limit: '2mb', verify: rawBodySaver }));
+app.use(express.static(__dirname));
+// Also serve assets from ./public for the web chat UI
+app.use(express.static(path.join(__dirname, 'public')));
+
+// LiveChat webhook endpoint
+// Lightweight GET for external health checks
+app.get('/livechat/webhook', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
+// --- Auth and Accounts ---
+// Bootstrap: create initial owner if none (email/password from env for first run)
+app.post('/api/auth/bootstrap', async (req, res) => {
+  try {
+    const email = (req.body?.email || process.env.MASTER_EMAIL || '').trim();
+    const password = (req.body?.password || process.env.MASTER_PASSWORD || '').trim();
+    if (!email || !password) return res.status(400).json({ success: false, error: 'email and password required' });
+    const user = await auth.createInitialMasterIfNone(email, password);
+  if (!user) return res.json({ success: true, message: 'Already initialized' });
+    res.json({ success: true, user });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ success: false, error: 'email and password required' });
+    const user = await auth.findUserByEmail(String(email).trim());
+    if (!user) return res.status(401).json({ success: false, error: 'Invalid credentials' });
+    const bcrypt = require('bcryptjs');
+    const ok = bcrypt.compareSync(String(password), user.password_hash);
+    if (!ok) return res.status(401).json({ success: false, error: 'Invalid credentials' });
+    const token = auth.signToken(user);
+    res.json({ success: true, token, user: { id: user.id, email: user.email, role: user.role } });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Owner: create master
+app.post('/api/masters', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const { email, password, permissions = {}, groupIds = [] } = req.body || {};
+    if (!email || !password) return res.status(400).json({ success: false, error: 'email and password required' });
+    const db = await getDb();
+    const exists = db.prepare('SELECT id FROM users WHERE email = ?').get(String(email).trim());
+    if (exists) return res.status(409).json({ success: false, error: 'Email already exists' });
+    const bcrypt = require('bcryptjs');
+    const hash = bcrypt.hashSync(String(password), 10);
+    const ins = db.prepare('INSERT INTO users (email, password_hash, role, permissions) VALUES (?, ?, ?, ?)');
+    const info = ins.run(String(email).trim(), hash, 'master', JSON.stringify(permissions || {}));
+    if (Array.isArray(groupIds) && groupIds.length) {
+      await auth.setMasterGroups(info.lastInsertRowid, groupIds);
+    }
+    res.status(201).json({ success: true, id: info.lastInsertRowid });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Owner: reset password for any user
+app.put('/api/users/:id/password', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { password } = req.body || {};
+    if (!password || String(password).length < 4) {
+      return res.status(400).json({ success: false, error: 'password required (min 4 chars)' });
+    }
+    const db = await getDb();
+    const user = db.prepare('SELECT id FROM users WHERE id = ?').get(id);
+    if (!user) return res.status(404).json({ success: false, error: 'User not found' });
+    const bcrypt = require('bcryptjs');
+    const hash = bcrypt.hashSync(String(password), 10);
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, id);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Owner: create agent directly (alias of /api/agents but owner-only ensures control)
+app.post('/api/owner/agents', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const { email, password, permissions = {}, groupIds = [] } = req.body || {};
+    if (!email || !password) return res.status(400).json({ success: false, error: 'email and password required' });
+    const id = await auth.registerAgent(String(email).trim(), String(password), permissions, groupIds);
+    res.status(201).json({ success: true, id });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Owner: delete any user (agent/master). Prevent deleting last owner.
+app.delete('/api/users/:id', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const db = await getDb();
+    const user = db.prepare('SELECT id, role FROM users WHERE id = ?').get(id);
+    if (!user) return res.status(404).json({ success: false, error: 'User not found' });
+    if (user.role === 'owner') {
+      const owners = db.prepare("SELECT COUNT(*) as c FROM users WHERE role = 'owner'").get().c;
+      if (owners <= 1) return res.status(400).json({ success: false, error: 'Cannot delete the last owner' });
+    }
+    const info = db.prepare('DELETE FROM users WHERE id = ?').run(id);
+    res.json({ success: true, deleted: info.changes > 0 });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// --- Per-Group AI Config and Promotions ---
+const { upsertGroupConfig, getGroupConfig, listGroupPromotions, addGroupPromotion, updateGroupPromotion, deleteGroupPromotion } = require('./db-utils.js');
+
+// Owner/Master: set brand/AI config for a group
+app.put('/api/groups/:id/config', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const groupId = Number(req.params.id);
+  const { brandName, aiSettings, rtpLink, livechatLicense, livechatGroupId, livechatWidgetSrc, livechatClientId, livechatWebhookSecret } = req.body || {};
+    if (!brandName) return res.status(400).json({ success: false, error: 'brandName is required' });
+
+    // Validate LiveChat settings if enabling any LiveChat feature fields
+    const lcLicense = (livechatLicense ?? '').toString().trim();
+    const lcWidgetSrc = (livechatWidgetSrc ?? '').toString().trim();
+    const lcGroupId = (livechatGroupId ?? '').toString().trim();
+    const lcClientId = (livechatClientId ?? '').toString().trim();
+    const lcWebhookSecret = (livechatWebhookSecret ?? '').toString().trim();
+    const livechatEnabling = !!(lcLicense || lcWidgetSrc || lcGroupId);
+    if (livechatEnabling) {
+      if (!lcClientId || !lcWebhookSecret) {
+        return res.status(400).json({ success: false, error: 'livechatClientId and livechatWebhookSecret are required when configuring LiveChat for a group' });
+      }
+    }
+    // Preserve existing AI settings when not provided in request
+    let mergedAi = {};
+    try {
+      const existing = await getGroupConfig(groupId);
+      const currentAi = (existing && existing.aiSettings) ? existing.aiSettings : {};
+      if (typeof aiSettings === 'undefined') {
+        mergedAi = currentAi; // keep existing
+      } else {
+        mergedAi = aiSettings || {};
+      }
+    } catch (_) {
+      mergedAi = aiSettings || {};
+    }
+
+    const cfg = await upsertGroupConfig(groupId, {
+      brandName,
+      aiSettings: mergedAi,
+      rtpLink: rtpLink || null,
+      livechatLicense: lcLicense || null,
+      livechatGroupId: lcGroupId || null,
+      livechatWidgetSrc: lcWidgetSrc || null,
+      livechatClientId: lcClientId || null,
+      livechatWebhookSecret: lcWebhookSecret || null
+    });
+    res.json({ success: true, config: cfg });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Get group config (auth any role)
+app.get('/api/groups/:id/config', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const groupId = Number(req.params.id);
+  const cfg = await getGroupConfig(groupId);
+    res.json({ success: true, config: cfg });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Owner-only: reset AI settings for a group to defaults (keeps brand and other fields)
+app.post('/api/groups/:id/ai/reset', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const gid = Number(req.params.id);
+    const existing = await getGroupConfig(gid);
+    if (!existing) return res.status(404).json({ success: false, error: 'Group config not found' });
+    const cfg = await upsertGroupConfig(gid, {
+      brandName: existing.brandName || 'GoodCasino',
+      aiSettings: {},
+      rtpLink: existing.rtpLink || null,
+      livechatLicense: existing.livechatLicense || null,
+      livechatGroupId: existing.livechatGroupId || null,
+      livechatWidgetSrc: existing.livechatWidgetSrc || null,
+      livechatClientId: existing.livechatClientId || null,
+      livechatWebhookSecret: existing.livechatWebhookSecret || null,
+      requirements: existing.requirements || null
+    });
+    res.json({ success: true, config: cfg });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Owner-only: reset AI settings across ALL groups
+app.post('/api/groups/ai/reset-all', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const groups = await auth.listGroups();
+    let resetCount = 0;
+    let skippedWithoutConfig = 0;
+    const resetGroups = [];
+    for (const g of (groups || [])) {
+      try {
+        const existing = await getGroupConfig(g.id);
+        if (!existing) { skippedWithoutConfig++; continue; }
+        await upsertGroupConfig(g.id, {
+          brandName: existing.brandName || 'GoodCasino',
+          aiSettings: {},
+          rtpLink: existing.rtpLink || null,
+          livechatLicense: existing.livechatLicense || null,
+          livechatGroupId: existing.livechatGroupId || null,
+          livechatWidgetSrc: existing.livechatWidgetSrc || null,
+          livechatClientId: existing.livechatClientId || null,
+          livechatWebhookSecret: existing.livechatWebhookSecret || null,
+          requirements: existing.requirements || null
+        });
+        resetCount++;
+        resetGroups.push({ id: g.id, name: g.name });
+      } catch (_) {
+        // continue
+      }
+    }
+    res.json({ success: true, totalGroups: (groups || []).length, resetCount, skippedWithoutConfig, resetGroups });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Owner/Master: group promotions CRUD
+app.get('/api/groups/:id/promotions', auth.authMiddleware(), async (req, res) => {
+  try {
+    const groupId = Number(req.params.id);
+    // Scope visibility for master/agent
+    if (req.user.role === 'master') {
+      const allowed = await auth.getMasterGroups(req.user.id);
+      const allowedIds = new Set((allowed || []).map(g => g.id));
+      if (!allowedIds.has(groupId)) return res.status(403).json({ success: false, error: 'Forbidden' });
+    } else if (req.user.role === 'agent') {
+      const allowed = await auth.getAgentGroups(req.user.id);
+      const allowedIds = new Set((allowed || []).map(g => g.id));
+      if (!allowedIds.has(groupId)) return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+    const items = await listGroupPromotions(groupId);
+    res.json({ success: true, promotions: items });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+app.post('/api/groups/:id/promotions', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (!(req.user.role === 'owner' || req.user.role === 'master')) {
+      return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+    const groupId = Number(req.params.id);
+    if (req.user.role === 'master') {
+      const allowed = await auth.getMasterGroups(req.user.id);
+      const allowedIds = new Set((allowed || []).map(g => g.id));
+      if (!allowedIds.has(groupId)) return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+  const { title, description, discount, code, timeLimit, terms, howToClaim, eligibleItems, eligibleGames, endDate } = req.body || {};
+    if (!title || !description) return res.status(400).json({ success: false, error: 'title and description required' });
+  const created = await addGroupPromotion(groupId, { title, description, discount, code, timeLimit, terms, howToClaim, eligibleItems, eligibleGames, endDate });
+    res.status(201).json({ success: true, promotion: created });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+app.put('/api/groups/:gid/promotions/:pid', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (!(req.user.role === 'owner' || req.user.role === 'master')) {
+      return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+    const gid = Number(req.params.gid);
+    if (req.user.role === 'master') {
+      const allowed = await auth.getMasterGroups(req.user.id);
+      const allowedIds = new Set((allowed || []).map(g => g.id));
+      if (!allowedIds.has(gid)) return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+    const pid = Number(req.params.pid);
+    const updated = await updateGroupPromotion(gid, pid, req.body || {});
+    if (!updated) return res.status(404).json({ success: false, error: 'Promotion not found' });
+    res.json({ success: true, promotion: updated });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+app.delete('/api/groups/:gid/promotions/:pid', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (!(req.user.role === 'owner' || req.user.role === 'master')) {
+      return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+    const gid = Number(req.params.gid);
+    if (req.user.role === 'master') {
+      const allowed = await auth.getMasterGroups(req.user.id);
+      const allowedIds = new Set((allowed || []).map(g => g.id));
+      if (!allowedIds.has(gid)) return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+    const pid = Number(req.params.pid);
+    const ok = await deleteGroupPromotion(gid, pid);
+    if (!ok) return res.status(404).json({ success: false, error: 'Promotion not found' });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Owner: list masters
+app.get('/api/masters', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const db = await getDb();
+  const masters = db.prepare("SELECT id, email, role, permissions FROM users WHERE role = 'master' ORDER BY id DESC").all();
+    const groupRows = db.prepare('SELECT mg.user_id, g.id AS group_id, g.name FROM master_groups mg INNER JOIN groups g ON g.id = mg.group_id').all();
+    const groupsByUser = groupRows.reduce((acc, r) => { (acc[r.user_id] ||= []).push({ id: r.group_id, name: r.name }); return acc; }, {});
+    const result = masters.map(m => ({ id: m.id, email: m.email, role: m.role, permissions: (()=>{ try { return JSON.parse(m.permissions||'{}'); } catch(_) { return {}; } })(), groups: groupsByUser[m.id] || [] }));
+    res.json({ success: true, masters: result });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Owner: update master permissions
+app.put('/api/masters/:id/permissions', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const permissions = req.body?.permissions || {};
+    const db = await getDb();
+  const upd = db.prepare("UPDATE users SET permissions = ? WHERE id = ? AND role = 'master'");
+    const info = upd.run(JSON.stringify(permissions), id);
+    if (info.changes === 0) return res.status(404).json({ success: false, error: 'Master not found' });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Owner: set master groups
+app.put('/api/masters/:id/groups', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { groupIds = [] } = req.body || {};
+    await auth.setMasterGroups(id, Array.isArray(groupIds) ? groupIds : []);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Owner: delete master
+app.delete('/api/masters/:id', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const db = await getDb();
+  const del = db.prepare("DELETE FROM users WHERE id = ? AND role = 'master'");
+    const info = del.run(id);
+    if (info.changes === 0) return res.status(404).json({ success: false, error: 'Master not found' });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Master/Owner: create agent
+app.post('/api/agents', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (!(req.user.role === 'master' || req.user.role === 'owner')) {
+      return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+    const { email, password, permissions = {}, groupIds = [] } = req.body || {};
+    if (!email || !password) return res.status(400).json({ success: false, error: 'email and password required' });
+    // Masters must assign at least one group so the agent is visible within their scope
+    if (req.user.role === 'master' && (!Array.isArray(groupIds) || groupIds.length === 0)) {
+      return res.status(400).json({ success: false, error: 'Masters must assign the new agent to at least one of their groups' });
+    }
+    // Masters can only assign agents to their own groups
+    if (req.user.role === 'master' && Array.isArray(groupIds) && groupIds.length) {
+      const allowed = await auth.getMasterGroups(req.user.id);
+      const allowedIds = new Set((allowed || []).map(g => g.id));
+      const invalid = groupIds.find(gid => !allowedIds.has(Number(gid)));
+      if (invalid != null) return res.status(403).json({ success: false, error: 'Forbidden (invalid group assignment)' });
+    }
+    const id = await auth.registerAgent(String(email).trim(), String(password), permissions, groupIds);
+    res.status(201).json({ success: true, id });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Master/Owner: set agent groups
+app.put('/api/agents/:id/groups', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (!(req.user.role === 'master' || req.user.role === 'owner')) {
+      return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+    const id = Number(req.params.id);
+    const { groupIds = [] } = req.body || {};
+    if (req.user.role === 'master') {
+      const allowed = await auth.getMasterGroups(req.user.id);
+      const allowedIds = new Set((allowed || []).map(g => g.id));
+      const invalid = (Array.isArray(groupIds) ? groupIds : []).find(gid => !allowedIds.has(Number(gid)));
+      if (invalid != null) return res.status(403).json({ success: false, error: 'Forbidden (invalid group assignment)' });
+    }
+    await auth.setAgentGroups(id, Array.isArray(groupIds) ? groupIds : []);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Master/Owner: create/list groups
+app.post('/api/groups', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const { name, livechatGroupId, livechat_group_id, lc_group_id } = req.body || {};
+    if (!name) return res.status(400).json({ success: false, error: 'name is required' });
+
+    const providedLcGroupId = [livechatGroupId, livechat_group_id, lc_group_id]
+      .find((val) => val !== undefined && val !== null && String(val).trim() !== '');
+
+    const id = await auth.createGroup(String(name).trim(), {
+      livechatGroupId: providedLcGroupId != null ? String(providedLcGroupId).trim() : null
+    });
+
+    res.status(201).json({
+      success: true,
+      id,
+      livechatGroupId: providedLcGroupId != null ? String(providedLcGroupId).trim() : null
+    });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+app.get('/api/groups', auth.authMiddleware(), async (req, res) => {
+  try {
+    let groups = await auth.listGroups();
+    if (req.user.role === 'master') {
+      const allowed = await auth.getMasterGroups(req.user.id);
+      const allowedIds = new Set((allowed || []).map(g => g.id));
+      groups = (groups || []).filter(g => allowedIds.has(g.id));
+    } else if (req.user.role === 'agent') {
+      const allowed = await auth.getAgentGroups(req.user.id);
+      const allowedIds = new Set((allowed || []).map(g => g.id));
+      groups = (groups || []).filter(g => allowedIds.has(g.id));
+    }
+    res.json({ success: true, groups });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Owner: delete a group
+app.delete('/api/groups/:id', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const gid = Number(req.params.id);
+    const db = await getDb();
+    const existing = db.prepare('SELECT id FROM groups WHERE id = ?').get(gid);
+    if (!existing) return res.status(404).json({ success: false, error: 'Group not found' });
+
+    // Defensive cascade for legacy DBs where FKs may not have ON DELETE CASCADE
+    const deleteGroupCascade = db.transaction((groupId) => {
+      try { db.prepare('DELETE FROM group_promotions WHERE group_id = ?').run(groupId); } catch(_) {}
+      try { db.prepare('DELETE FROM groups_config WHERE group_id = ?').run(groupId); } catch(_) {}
+      try { db.prepare('DELETE FROM agent_groups WHERE group_id = ?').run(groupId); } catch(_) {}
+      try { db.prepare('DELETE FROM master_groups WHERE group_id = ?').run(groupId); } catch(_) {}
+      try { db.prepare('DELETE FROM chat_groups WHERE group_id = ?').run(groupId); } catch(_) {}
+      try { db.prepare('UPDATE ai_usage SET group_id = NULL WHERE group_id = ?').run(groupId); } catch(_) {}
+      const infoInner = db.prepare('DELETE FROM groups WHERE id = ?').run(groupId);
+      return infoInner.changes > 0;
+    });
+    const deleted = deleteGroupCascade(gid);
+    res.json({ success: true, deleted });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Fallback: some hosts/proxies block DELETE; provide POST-based deletion
+app.post('/api/groups/:id/delete', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const gid = Number(req.params.id);
+    const db = await getDb();
+    const existing = db.prepare('SELECT id FROM groups WHERE id = ?').get(gid);
+    if (!existing) return res.status(404).json({ success: false, error: 'Group not found' });
+    const deleteGroupCascade = db.transaction((groupId) => {
+      try { db.prepare('DELETE FROM group_promotions WHERE group_id = ?').run(groupId); } catch(_) {}
+      try { db.prepare('DELETE FROM groups_config WHERE group_id = ?').run(groupId); } catch(_) {}
+      try { db.prepare('DELETE FROM agent_groups WHERE group_id = ?').run(groupId); } catch(_) {}
+      try { db.prepare('DELETE FROM master_groups WHERE group_id = ?').run(groupId); } catch(_) {}
+      try { db.prepare('DELETE FROM chat_groups WHERE group_id = ?').run(groupId); } catch(_) {}
+      try { db.prepare('UPDATE ai_usage SET group_id = NULL WHERE group_id = ?').run(groupId); } catch(_) {}
+      const infoInner = db.prepare('DELETE FROM groups WHERE id = ?').run(groupId);
+      return infoInner.changes > 0;
+    });
+    const deleted = deleteGroupCascade(gid);
+    res.json({ success: true, deleted, method: 'POST' });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Master/Owner: list agents (with groups)
+app.get('/api/agents', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (!(req.user.role === 'master' || req.user.role === 'owner')) {
+      return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+    const db = await getDb();
+  const agents = db.prepare("SELECT id, email, role, permissions FROM users WHERE role = 'agent' ORDER BY id DESC").all();
+    const groupRows = db.prepare('SELECT ag.user_id, g.id AS group_id, g.name FROM agent_groups ag INNER JOIN groups g ON g.id = ag.group_id').all();
+    const groupsByUser = groupRows.reduce((acc, r) => { (acc[r.user_id] ||= []).push({ id: r.group_id, name: r.name }); return acc; }, {});
+    let result = agents.map(a => ({
+      id: a.id,
+      email: a.email,
+      role: a.role,
+      permissions: (() => { try { return JSON.parse(a.permissions || '{}'); } catch(_) { return {}; } })(),
+      groups: groupsByUser[a.id] || []
+    }));
+    if (req.user.role === 'master') {
+      const allowed = await auth.getMasterGroups(req.user.id);
+      const allowedIds = new Set((allowed || []).map(g => g.id));
+      result = result
+        .map(a => ({
+          ...a,
+          groups: (a.groups || []).filter(g => allowedIds.has(g.id))
+        }))
+        .filter(a => (a.groups || []).length > 0); // only agents with overlap
+    }
+    res.json({ success: true, agents: result });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Master/Owner: update agent permissions
+app.put('/api/agents/:id/permissions', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (!(req.user.role === 'master' || req.user.role === 'owner')) {
+      return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+    const id = Number(req.params.id);
+    const permissions = req.body?.permissions || {};
+    const db = await getDb();
+  const upd = db.prepare("UPDATE users SET permissions = ? WHERE id = ? AND role = 'agent'");
+    const info = upd.run(JSON.stringify(permissions), id);
+    if (info.changes === 0) return res.status(404).json({ success: false, error: 'Agent not found' });
+    await auth.logAgentAction(req.user.id, 'agent_permissions_update', { targetId: id, permissions }, null);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Master/Owner: delete agent
+app.delete('/api/agents/:id', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (!(req.user.role === 'master' || req.user.role === 'owner')) {
+      return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+    const id = Number(req.params.id);
+    const db = await getDb();
+  const del = db.prepare("DELETE FROM users WHERE id = ? AND role = 'agent'");
+    const info = del.run(id);
+    if (info.changes === 0) return res.status(404).json({ success: false, error: 'Agent not found' });
+    await auth.logAgentAction(req.user.id, 'agent_delete', { targetId: id }, null);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// Agent: my logs
+app.get('/api/agents/me/logs', auth.authMiddleware(), async (req, res) => {
+  try { const logs = await auth.listAgentLogs(req.user.id); res.json({ success: true, logs }); }
+  catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ============ Chat Mapping Endpoints ============
+
+// Get all unmapped chats
+app.get('/api/chats/unmapped', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (!(req.user.role === 'master' || req.user.role === 'owner')) {
+      return res.status(403).json({ success: false, error: 'Master or Owner role required' });
+    }
+    
+    const db = await getDb();
+    const unmappedChats = db.prepare(`
+      SELECT DISTINCT m.chat_id, COUNT(m.id) as message_count, MAX(m.timestamp) as last_activity
+      FROM messages m
+      LEFT JOIN chat_groups cg ON cg.chat_id = m.chat_id
+      WHERE cg.group_id IS NULL
+      GROUP BY m.chat_id
+      ORDER BY last_activity DESC
+    `).all();
+    
+    res.json({ success: true, chats: unmappedChats });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Get all chats with their group mappings
+app.get('/api/chats', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (!(req.user.role === 'master' || req.user.role === 'owner')) {
+      return res.status(403).json({ success: false, error: 'Master or Owner role required' });
+    }
+    
+    const db = await getDb();
+    const chats = db.prepare(`
+      SELECT 
+        m.chat_id,
+        cg.group_id,
+        g.name as group_name,
+        COUNT(m.id) as message_count,
+        MAX(m.timestamp) as last_activity
+      FROM messages m
+      LEFT JOIN chat_groups cg ON cg.chat_id = m.chat_id
+      LEFT JOIN groups g ON g.id = cg.group_id
+      GROUP BY m.chat_id
+      ORDER BY last_activity DESC
+    `).all();
+    
+    res.json({ success: true, chats });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Map a chat to a group
+app.post('/api/chats/:chatId/map', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (!(req.user.role === 'master' || req.user.role === 'owner')) {
+      return res.status(403).json({ success: false, error: 'Master or Owner role required' });
+    }
+    
+    const chatId = req.params.chatId;
+    const { groupId } = req.body;
+    
+    if (!groupId) {
+      return res.status(400).json({ success: false, error: 'groupId is required' });
+    }
+    
+    const db = await getDb();
+    
+    // Verify group exists
+    const group = db.prepare('SELECT id, name FROM groups WHERE id = ?').get(groupId);
+    if (!group) {
+      return res.status(404).json({ success: false, error: 'Group not found' });
+    }
+    
+    // Verify chat exists
+    const chatExists = db.prepare('SELECT COUNT(*) as count FROM messages WHERE chat_id = ?').get(chatId);
+    if (!chatExists || chatExists.count === 0) {
+      return res.status(404).json({ success: false, error: 'Chat not found' });
+    }
+    
+    // Insert or update mapping
+    const stmt = db.prepare('INSERT OR REPLACE INTO chat_groups (chat_id, group_id) VALUES (?, ?)');
+    stmt.run(chatId, groupId);
+    
+    // Log the action
+    await auth.logAgentAction(req.user.id, 'chat_mapped', { chatId, groupId, groupName: group.name }, null);
+    
+    res.json({ 
+      success: true, 
+      message: `Chat ${chatId} mapped to group ${group.name}`,
+      chatId,
+      groupId: group.id,
+      groupName: group.name
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Unmap a chat from its group
+app.delete('/api/chats/:chatId/map', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (!(req.user.role === 'master' || req.user.role === 'owner')) {
+      return res.status(403).json({ success: false, error: 'Master or Owner role required' });
+    }
+    
+    const chatId = req.params.chatId;
+    const db = await getDb();
+    
+    const stmt = db.prepare('DELETE FROM chat_groups WHERE chat_id = ?');
+    const info = stmt.run(chatId);
+    
+    if (info.changes === 0) {
+      return res.status(404).json({ success: false, error: 'Chat mapping not found' });
+    }
+    
+    await auth.logAgentAction(req.user.id, 'chat_unmapped', { chatId }, null);
+    
+    res.json({ success: true, message: `Chat ${chatId} unmapped` });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post('/livechat/webhook', async (req, res) => {
+  if (String(process.env.DISABLE_LIVECHAT_WEBHOOK || '').toLowerCase() === 'true') {
+    return res.json({ status: 'disabled' });
+  }
+  const { secret_key: bodySecret, action, payload } = req.body || {};
+  const headerSecret = (req.headers['x-webhook-secret'] ?? req.headers['x-livechat-webhook-secret'] ?? req.headers['x-livechat-secret'] ?? '').toString().trim();
+  const directSecretCandidates = [bodySecret, headerSecret]
+    .map((val) => (val == null ? '' : val).toString().trim())
+    .filter(Boolean);
+  // Accept either the global secret or any group's configured webhook secret
+  let allowedSecrets = new Set();
+  const secretToGroup = new Map();
+  const globalSecret = (process.env.LIVECHAT_WEBHOOK_SECRET ?? '').toString().trim();
+  if (globalSecret) allowedSecrets.add(globalSecret);
+  try {
+    const db = await getDb();
+    const rows = db.prepare('SELECT group_id, livechat_webhook_secret FROM groups_config WHERE livechat_webhook_secret IS NOT NULL').all();
+    for (const r of (rows || [])) { const s = (r.livechat_webhook_secret || '').toString().trim(); if (s) { allowedSecrets.add(s); secretToGroup.set(s, Number(r.group_id)); } }
+  } catch (_) { /* ignore, fallback to env */ }
+
+  let matchedSecret = null;
+  for (const candidate of directSecretCandidates) {
+    if (allowedSecrets.has(candidate)) {
+      matchedSecret = candidate;
+      break;
+    }
+  }
+  if (!matchedSecret) {
+    const signatureHeader = (req.headers['x-livechat-signature'] ?? req.headers['x-lc-signature'] ?? '').toString().trim();
+    const rawBodyBuffer = req.rawBody instanceof Buffer ? req.rawBody : Buffer.from(JSON.stringify(req.body || {}));
+    matchedSecret = matchSecretFromSignature(signatureHeader, rawBodyBuffer, allowedSecrets);
+    if (!matchedSecret) {
+      console.warn('Invalid webhook secret/signature', {
+        hasGlobal: !!globalSecret,
+        totalAllowed: allowedSecrets.size,
+        directSecretsReceived: directSecretCandidates.length,
+        signaturePresent: !!signatureHeader
+      });
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+  }
+  console.log('Webhook action:', action);
+  console.log('Webhook payload:', payload);
+  
+  // Ack immediately to prevent LiveChat retries
+  res.json({ status: 'received' });
+
+  // Hand off to Agent Chat Manager for efficient processing
+  // Forward to AgentChatManager for metrics/observer features only (auto-replies stay disabled).
+  agentChatManager.handleWebhookEvent(action, payload);
+
+  // Process asynchronously to avoid timeouts/retries
+  setImmediate(async () => {
+    try {
+      // Enhanced ticket logging - show all ticket details immediately
+      console.log('\n🎫 ===== NEW TICKET DETECTED =====');
+      console.log(`📅 Timestamp: ${new Date().toISOString()}`);
+      console.log(`🔔 Action: ${action}`);
+      console.log(`💬 Chat ID: ${payload?.chat_id || payload?.chat?.id || payload?.id || 'Unknown'}`);
+      
+      // Extract and display customer information
+      const chatId = payload?.chat_id || payload?.chat?.id || payload?.id;
+      const customerInfo = {
+        chatId: chatId,
+        action: action,
+        eventId: payload?.event?.id || payload?.message?.id || 'N/A',
+        authorType: payload?.event?.author_type || payload?.message?.author_type || payload?.author_type || 'Unknown',
+        messageText: payload?.event?.text || payload?.message?.text || 'No message',
+        timestamp: new Date().toISOString(),
+        groupId: payload?.chat?.group_id || payload?.group_id || 'Not specified',
+        threadId: payload?.thread?.id || payload?.thread_id || 'N/A'
+      };
+      
+      console.log('👤 Customer Info:');
+      console.log(`   - Author Type: ${customerInfo.authorType}`);
+      console.log(`   - Event ID: ${customerInfo.eventId}`);
+      console.log(`   - Thread ID: ${customerInfo.threadId}`);
+      console.log(`   - LiveChat Group: ${customerInfo.groupId}`);
+      
+      if (customerInfo.messageText && customerInfo.messageText !== 'No message') {
+        console.log(`💭 Message: "${customerInfo.messageText.substring(0, 100)}${customerInfo.messageText.length > 100 ? '...' : ''}"`);
+      }
+      
+      // Show ticket status
+      console.log('🎯 Ticket Status:');
+      console.log(`   - Type: ${action === 'chat_started' ? 'New Chat Started' : action === 'incoming_event' ? 'Customer Message' : action}`);
+      console.log(`   - Auto-response: ${process.env.AUTO_RESPOND_TO_ALL_MESSAGES === 'true' ? 'Enabled' : 'Disabled'}`);
+      console.log(`   - Webhook Secret: ${matchedSecret ? 'Valid' : 'Invalid'}`);
+      console.log('🎫 ================================\n');
+
+      // Proactive welcome on chat/thread start before first customer message
+      // Also auto-map chat to group if webhook secret corresponds to a group,
+      // or if payload contains a LiveChat group_id that matches groups_config.livechat_group_id
+      if (action === 'chat_started' || action === 'thread_started') {
+        console.log('🆕 Processing new chat/thread start...');
+        try {
+          const chatIdStart = payload?.chat_id || payload?.chat?.id || payload?.id;
+          if (chatIdStart) {
+            try {
+              let gid = secretToGroup.get(matchedSecret);
+              
+              // ENHANCED: Try multiple locations for LiveChat Group ID
+              let maybePayloadGroupId = null;
+              if (!gid) {
+                console.log('🔍 Attempting to extract LiveChat Group ID from payload...');
+                
+                // Try all possible locations where LiveChat might send group_id
+                const groupIdCandidates = [
+                  payload?.chat?.properties?.group,        // LiveChat properties
+                  payload?.properties?.group,              // Root properties
+                  payload?.chat?.group_id,                 // Direct chat property
+                  payload?.chat?.group?.id,                // Nested group object
+                  payload?.group_id,                       // Top-level
+                  payload?.group?.id,                      // Top-level nested
+                  payload?.event?.properties?.group,       // Event properties
+                  payload?.thread?.properties?.group       // Thread properties
+                ];
+                
+                console.log('📊 Group ID candidates found:', groupIdCandidates.filter(c => c != null));
+                
+                for (const candidate of groupIdCandidates) {
+                  if (candidate) {
+                    const normalized = String(candidate).trim();
+                    if (normalized && normalized !== '0' && normalized !== 'null' && normalized !== 'undefined') {
+                      maybePayloadGroupId = normalized;
+                      console.log(`✅ Found LiveChat Group ID: "${maybePayloadGroupId}"`);
+                      break;
+                    }
+                  }
+                }
+                
+                if (maybePayloadGroupId) {
+                  const db = await getDb();
+                  const row = db.prepare('SELECT group_id FROM groups_config WHERE livechat_group_id = ?').get(maybePayloadGroupId);
+                  
+                  if (row && row.group_id) {
+                    gid = Number(row.group_id);
+                    console.log(`🎯 Matched LiveChat Group ID "${maybePayloadGroupId}" → Internal Group ${gid}`);
+                  } else {
+                    console.warn(`⚠️ LiveChat Group ID "${maybePayloadGroupId}" found but NO MATCH in groups_config table`);
+                    console.warn('   👉 Check your group configuration: Make sure livechat_group_id is set');
+                    
+                    // Show all configured groups for debugging
+                    const allGroups = db.prepare('SELECT g.id, g.name, gc.livechat_group_id FROM groups g LEFT JOIN groups_config gc ON gc.group_id = g.id').all();
+                    console.warn('   📋 Configured groups:', allGroups.map(g => `Group ${g.id} "${g.name}" → LC Group "${g.livechat_group_id || 'NOT SET'}"`));
+                  }
+                } else {
+                  console.warn('⚠️ No LiveChat Group ID found in webhook payload');
+                  console.warn('   Payload structure:', JSON.stringify(payload, null, 2).substring(0, 500));
+                }
+              } else {
+                console.log(`✅ Mapped via webhook secret → Internal Group ${gid}`);
+              }
+              
+              // SAVE LiveChat metadata to database for future reference
+              try {
+                const { saveChatLivechatMetadata } = require('./db-utils.js');
+                const metadata = {
+                  livechat_group_id: maybePayloadGroupId || payload?.chat?.properties?.group || null,
+                  livechat_license: payload?.chat?.access?.license_id || payload?.license_id || null,
+                  access_group_ids: payload?.chat?.access?.group_ids || null,
+                  webhook_action: action,
+                  payload_snapshot: {
+                    chat_id: chatIdStart,
+                    properties: payload?.chat?.properties || payload?.properties || null,
+                    access: payload?.chat?.access || null
+                  }
+                };
+                await saveChatLivechatMetadata(String(chatIdStart), metadata);
+                console.log(`💾 Saved LiveChat metadata for chat ${chatIdStart} (LC Group: ${metadata.livechat_group_id || 'N/A'})`);
+              } catch (metaErr) {
+                console.warn('⚠️ Failed to save LiveChat metadata:', metaErr.message);
+              }
+              
+              if (gid) {
+                const { setChatGroup } = require('./db-utils.js');
+                await setChatGroup(String(chatIdStart), Number(gid));
+                console.log(`🔗 ✅ Chat ${chatIdStart} successfully mapped to Group ${gid}`);
+              } else {
+                console.warn(`⚠️ Chat ${chatIdStart} could NOT be mapped to any group`);
+              }
+            } catch (mapErr) { console.error('❌ Auto-map on chat_started failed:', mapErr?.message || mapErr, mapErr?.stack); }
+            const dbCheck = await getDb();
+            const existingMsg = dbCheck.prepare('SELECT 1 FROM messages WHERE chat_id = ? LIMIT 1').get(chatIdStart);
+            if (!existingMsg) {
+              const welcome = process.env.BOT_WELCOME_MESSAGE || 'Halo bosku! Ada yang bisa saya bantu?';
+              console.log('💬 Sending proactive welcome for new chat', { chatId: chatIdStart });
+              try {
+                await sendReply(
+                  {
+                    chat_id: chatIdStart,
+                    chat: payload?.chat,
+                    event: payload?.event,
+                    thread: payload?.thread,
+                    group_id: maybePayloadGroupId || payload?.group_id || null
+                  },
+                  welcome,
+                  {
+                    internalGroupId: gid || null,
+                    groupId: maybePayloadGroupId || payload?.group_id || null
+                  }
+                );
+                try { await addMessage(dbCheck, chatIdStart, 'assistant', welcome); } catch(_) {}
+              } catch(e) {
+                console.warn('Failed to send proactive welcome', e?.response?.data || e?.message || e);
+              }
+            }
+          }
+        } catch(e) { console.warn('Proactive welcome flow failed (non-fatal):', e?.message || e); }
+        // Continue; do not return so that first message (if also included) is still processed
+      }
+
+    const isCustomerMessageAction = action === 'customer_message';
+    const isIncomingEventMessage = action === 'incoming_event' && payload?.event?.type === 'message';
+    if (!isCustomerMessageAction && !isIncomingEventMessage) return;
+
+    const eventPayload = isCustomerMessageAction ? (payload?.message || payload?.event || {}) : (payload?.event || {});
+    // Update chatId with more comprehensive extraction for message processing
+    const messageChatId = payload?.chat_id ||
+      payload?.chat?.id ||
+      eventPayload?.chat_id ||
+      eventPayload?.chat?.id ||
+      payload?.thread?.chat_id ||
+      payload?.thread?.id || chatId;
+    const text = (isCustomerMessageAction ? (payload?.message?.text ?? payload?.event?.text ?? '') : (payload?.event?.text ?? '')) || '';
+    const authorIdRaw = eventPayload?.author_id || eventPayload?.author?.id || payload?.author_id || payload?.author?.id || null;
+    const createdAtRaw = eventPayload?.created_at || eventPayload?.createdAt || payload?.event?.created_at || payload?.created_at || payload?.timestamp || null;
+    const { normalizedEventId: webhookEventId, fingerprint: webhookFingerprint } = buildEventIdentity(
+      messageChatId,
+      eventPayload?.id || eventPayload?.custom_id,
+      { text, authorId: authorIdRaw, createdAt: createdAtRaw }
+    );
+    const customerSignature = buildCustomerMessageSignature(messageChatId, text, authorIdRaw);
+    const webhookDedupeKeys = Array.from(new Set([webhookEventId, webhookFingerprint, customerSignature.signature].filter(Boolean)));
+    let dbForChatState = null;
+    let chatStateSnapshot = null;
+    let autoAiStateSnapshot = null;
+    let previousPersistentSignature = null;
+    try {
+      dbForChatState = await getDb();
+      chatStateSnapshot = await getChatState(dbForChatState, messageChatId) || {};
+      if (chatStateSnapshot && typeof chatStateSnapshot.__autoAi === 'object' && chatStateSnapshot.__autoAi !== null) {
+        autoAiStateSnapshot = { ...chatStateSnapshot.__autoAi };
+        previousPersistentSignature = autoAiStateSnapshot.lastCustomerSignature || null;
+      }
+    } catch (stateErr) {
+      console.warn('Non-fatal: failed to load chat state for dedupe', stateErr?.message || stateErr);
+    }
+
+    const autoAiStateBeforeUpdate = autoAiStateSnapshot ? { ...autoAiStateSnapshot } : null;
+
+    if (previousPersistentSignature && previousPersistentSignature === customerSignature.signature) {
+      console.log('🛑 Duplicate message skipped via persistent signature', {
+        chatId: messageChatId,
+        signature: customerSignature.signature
+      });
+      webhookDedupeKeys.forEach((key) => markAutoAiEventProcessed(messageChatId, key));
+      return;
+    }
+    
+    // Enhanced customer message logging
+    if (text && messageChatId) {
+      console.log('\n💬 ===== CUSTOMER MESSAGE =====');
+      console.log(`📱 Chat ID: ${messageChatId}`);
+      console.log(`🕐 Time: ${new Date().toLocaleString()}`);
+      console.log(`👤 Author: ${eventPayload?.author_type || 'customer'}`);
+      console.log(`📝 Message: "${text}"`);
+      console.log(`🆔 Event ID: ${webhookEventId || 'N/A'}`);
+      console.log(`📊 Message Length: ${text.length} characters`);
+      
+      // Detect message intent for early logging
+      try {
+        const { isDepositInquiry, isWithdrawalInquiry, isTurnoverInquiry, isOffTopicConversation, detectLanguage } = require('./newtest3.js');
+        const detectedLang = detectLanguage(text);
+        const intents = [];
+        
+        if (isDepositInquiry(text)) intents.push('💰 DEPOSIT_INQUIRY');
+        if (isWithdrawalInquiry(text)) intents.push('💸 WITHDRAWAL_INQUIRY');
+        if (isTurnoverInquiry(text)) intents.push('📊 TURNOVER_INQUIRY');
+        if (isOffTopicConversation(text)) intents.push('🔄 OFF_TOPIC');
+        
+        console.log(`🗣️  Language: ${detectedLang === 'id' ? 'Indonesian' : 'English'}`);
+        console.log(`🎯 Detected Intent: ${intents.length > 0 ? intents.join(', ') : 'GENERAL_INQUIRY'}`);
+        
+        if (intents.length > 0) {
+          console.log(`⚡ Auto-actions: ${intents.includes('💰 DEPOSIT_INQUIRY') || intents.includes('💸 WITHDRAWAL_INQUIRY') ? 'Support ping will be sent' : 'Standard AI response'}`);
+        }
+      } catch (e) {
+        console.log('🎯 Intent detection: Standard processing');
+      }
+      
+      console.log('💬 =============================\n');
+    }
+    
+      // Auto-map chat to group using webhook secret or payload group_id (if known)
+      try {
+        let gid = secretToGroup.get(matchedSecret);
+        
+        // ENHANCED: Try multiple locations for LiveChat Group ID
+        if (!gid) {
+          console.log('🔍 [incoming_event] Attempting to extract LiveChat Group ID from payload...');
+          
+          // Try all possible locations where LiveChat might send group_id
+          const groupIdCandidates = [
+            payload?.chat?.properties?.group,        // LiveChat properties
+            payload?.properties?.group,              // Root properties
+            payload?.chat?.group_id,                 // Direct chat property
+            payload?.chat?.group?.id,                // Nested group object
+            payload?.group_id,                       // Top-level
+            payload?.group?.id,                      // Top-level nested
+            payload?.event?.properties?.group,       // Event properties
+            payload?.thread?.properties?.group       // Thread properties
+          ];
+          
+          console.log('📊 [incoming_event] Group ID candidates found:', groupIdCandidates.filter(c => c != null));
+          
+          let maybePayloadGroupId = null;
+          for (const candidate of groupIdCandidates) {
+            if (candidate) {
+              const normalized = String(candidate).trim();
+              if (normalized && normalized !== '0' && normalized !== 'null' && normalized !== 'undefined') {
+                maybePayloadGroupId = normalized;
+                console.log(`✅ [incoming_event] Found LiveChat Group ID: "${maybePayloadGroupId}"`);
+                break;
+              }
+            }
+          }
+          
+          if (maybePayloadGroupId) {
+            const db = await getDb();
+            const row = db.prepare('SELECT group_id FROM groups_config WHERE livechat_group_id = ?').get(maybePayloadGroupId);
+            
+            if (row && row.group_id) {
+              gid = Number(row.group_id);
+              console.log(`🎯 [incoming_event] Matched LiveChat Group ID "${maybePayloadGroupId}" → Internal Group ${gid}`);
+            } else {
+              console.warn(`⚠️ [incoming_event] LiveChat Group ID "${maybePayloadGroupId}" found but NO MATCH in groups_config`);
+            }
+          } else {
+            console.warn('⚠️ [incoming_event] No LiveChat Group ID found in webhook payload');
+          }
+        } else {
+          console.log(`✅ [incoming_event] Mapped via webhook secret → Internal Group ${gid}`);
+        }
+        
+        if (gid && messageChatId) {
+          const { setChatGroup } = require('./db-utils.js');
+          await setChatGroup(String(messageChatId), Number(gid));
+          console.log(`🔗 ✅ [incoming_event] Chat ${messageChatId} successfully mapped to Group ${gid}`);
+        } else if (!gid) {
+          console.warn(`⚠️ [incoming_event] Chat ${messageChatId} could NOT be mapped to any group`);
+        }
+      } catch (mapErr) { console.error('❌ Auto-map on incoming_event failed:', mapErr?.message || mapErr); }
+      
+      if (webhookDedupeKeys.some((key) => hasProcessedAutoAiEvent(messageChatId, key))) {
+        console.log('🛑 Ignored duplicate event (memory cache)', { chatId: messageChatId, keys: webhookDedupeKeys });
+        return;
+      }
+      if (isDuplicateEvent(webhookEventId)) {
+        console.log('🛑 Ignored duplicate event', webhookEventId);
+        return;
+      }
+
+      // Update chat activity and store incoming message with enhanced logging
+      try {
+        await updateChatActivity(messageChatId, 'livechat');
+        const dbi = dbForChatState || await getDb();
+        if (text) {
+          await addMessage(dbi, messageChatId, 'user', text);
+          console.log(`💾 Stored customer message in database: Chat ${messageChatId}, Length: ${text.length}`);
+          trackMessage(messageChatId, 'user');
+        }
+      } catch (e) {
+        console.warn('Non-fatal: failed to persist incoming message', e?.message || e);
+      }
+        let previousEventId = null;
+        try {
+          previousEventId = await getLastCustomerEventId(messageChatId);
+        } catch (err) {
+          console.warn('Non-fatal: failed to read previous customer event id (webhook)', err?.message || err);
+        }
+        try {
+          await updateLastCustomerEventId(messageChatId, webhookEventId);
+        } catch (err) {
+          console.warn('Non-fatal: failed to persist last customer event id (webhook)', err?.message || err);
+        }
+      // Avoid loops: ignore events created by this app/client_id only when not from a customer author
+      const sourceInfo = eventPayload?.properties?.source || {};
+      const sourceClient = sourceInfo?.client_id;
+      const sourceTypeLower = String(sourceInfo?.type || '').toLowerCase();
+      const authorTypeRaw = (isCustomerMessageAction ? (payload?.message?.author_type || payload?.message?.author?.type || null) : null) ||
+                            payload?.event?.author_type ||
+                            payload?.author_type ||
+                            payload?.event?.author ||
+                            sourceInfo?.type ||
+                            null;
+      const authorType = authorTypeRaw ? String(authorTypeRaw) : null;
+      const authorTypeLower = authorType ? authorType.toLowerCase() : '';
+      const allowedAuthorTypes = new Set(['customer']);
+      if (sourceClient) {
+        // Ignore messages created by our own clients (global or any group-level client IDs)
+        const globalClient = (process.env.LIVECHAT_CLIENT_ID ?? '').toString().trim();
+        let clientIds = new Set();
+        if (globalClient) clientIds.add(globalClient);
+        try {
+          const db = await getDb();
+          const rows = db.prepare('SELECT livechat_client_id FROM groups_config WHERE livechat_client_id IS NOT NULL').all();
+          for (const r of (rows || [])) { const cid = (r.livechat_client_id || '').toString().trim(); if (cid) clientIds.add(cid); }
+        } catch (_) { /* ignore */ }
+        const fromOwnIntegration = clientIds.has(String(sourceClient));
+        if (fromOwnIntegration && !allowedAuthorTypes.has(authorTypeLower) && !allowedAuthorTypes.has(sourceTypeLower)) {
+          console.log('Ignored own message (sourceClient loop prevention)', {
+            chatId,
+            sourceClient,
+            authorType: authorType || null,
+            sourceType: sourceInfo?.type || null
+          });
+          return;
+        }
+      }
+      if (authorType && !allowedAuthorTypes.has(authorTypeLower)) {
+          console.log('🛑 Ignored message due to authorType not in allowed list', { chatId: messageChatId, authorType, allowed: Array.from(allowedAuthorTypes) });
+        return;
+      } else {
+        console.log('✅ Accepted inbound message', { chatId: messageChatId, authorType: authorType || sourceInfo?.type || 'unknown', action });
+      }
+
+      // Cooldown per chat to avoid rapid-fire replies (can be disabled via env)
+      const cooldownMs = parseInt(process.env.LIVECHAT_REPLY_COOLDOWN_MS || '3000', 10);
+      const disableCd = String(process.env.DISABLE_WEBHOOK_COOLDOWN || '').toLowerCase() === 'true';
+      if (!global.__lastReplyByChat) global.__lastReplyByChat = new Map();
+      const now = Date.now();
+      const last = global.__lastReplyByChat.get(messageChatId) || 0;
+      const forceReply = String(process.env.FORCE_WEBHOOK_REPLY || '').toLowerCase() === 'true';
+      if (!disableCd && !forceReply && now - last < cooldownMs) {
+        console.log('🕒 Cooldown active; skipping reply', { chatId: messageChatId, waited: now - last, cooldownMs, forceReply });
+        return;
+      } else if (forceReply) {
+        console.log('⚡ FORCE_WEBHOOK_REPLY active – bypassing cooldown', { chatId: messageChatId });
+      }
+      global.__lastReplyByChat.set(messageChatId, now);
+
+      // ============================================================================
+      // WEBHOOK AUTO-REPLY RE-ENABLED - Primary response mechanism
+      // ============================================================================
+      // Webhook-based responses are now the primary auto-reply system.
+      // This ensures immediate responses to customer messages via webhooks.
+      // ============================================================================
+      
+      console.log('✅ Webhook auto-reply ENABLED - processing customer message');
+      console.log('   Chat:', messageChatId, '| Message:', text.slice(0, 50) + '...');
+      
+      // Continue to webhook auto-reply processing
+      
+      const processingStartTime = Date.now();
+      console.log('\n🤖 ===== AI PROCESSING STARTED =====');
+      console.log(`📱 Chat ID: ${messageChatId}`);
+      console.log(`⏰ Started: ${new Date().toLocaleString()}`);
+      console.log(`📝 Processing message: "${text.slice(0, 100)}${text.length > 100 ? '...' : ''}"`);
+      console.log(`🔧 AI Mode: ${process.env.UNRESTRICTED_BOT === 'true' ? 'Unrestricted GPT' : 'Structured Bot'}`);
+
+      // Generate a smart reply via GoodCasino bot logic (AI first) with enhanced real-time processing
+      gcGetChatState(messageChatId);
+      let reply = null;
+      let aiProcessingTime = 0;
+      
+      try {
+        const aiStartTime = Date.now();
+        
+        // Set a reasonable timeout for AI processing (default 15 seconds)
+        const aiTimeout = parseInt(process.env.AI_RESPONSE_TIMEOUT_MS || '15000', 10);
+        
+        const aiPromise = gcGetResponse(messageChatId, text, `${messageChatId}_${Date.now()}`);
+        const timeoutPromise = new Promise((_, reject) => {
+          setTimeout(() => reject(new Error(`AI response timeout after ${aiTimeout}ms`)), aiTimeout);
+        });
+        
+        reply = await Promise.race([aiPromise, timeoutPromise]);
+        aiProcessingTime = Date.now() - aiStartTime;
+        
+        console.log(`⚡ AI response generated successfully in ${aiProcessingTime}ms`);
+        
+        // Log response quality metrics
+        if (reply && reply.trim()) {
+          console.log(`📊 Response metrics: ${reply.length} chars, ${reply.split(' ').length} words`);
+        }
+        
+      } catch (e) {
+        aiProcessingTime = Date.now() - processingStartTime;
+        console.error(`❌ gcGetResponse failed after ${aiProcessingTime}ms:`, { 
+          chatId: messageChatId, 
+          error: e?.message || e,
+          isTimeout: e?.message?.includes('timeout')
+        });
+        
+        // Enhanced fallback selection based on error type
+        if (e?.message?.includes('timeout')) {
+          console.log('⏰ AI timeout detected - using fast fallback');
+        }
+      }
+      
+      // If no reply produced, choose context-aware fallback with enhanced intelligence
+      let finalText = (reply && reply.trim()) ? reply.trim() : '';
+      if (!finalText) {
+        try {
+          const dbiTmp = await getDb();
+          const hasAny = dbiTmp.prepare('SELECT 1 FROM messages WHERE chat_id = ? AND role = ? LIMIT 1').get(messageChatId, 'assistant');
+          
+          // Enhanced context-aware fallback selection
+          const isFirstInteraction = !hasAny;
+          const messageLength = text.length;
+          const isShortMessage = messageLength <= 20;
+          const isLongMessage = messageLength > 200;
+          
+          // Detect message type for better fallback
+          let fallbackType = 'standard';
+          if (isFirstInteraction) {
+            fallbackType = 'welcome';
+          } else if (text.toLowerCase().includes('deposit') || text.toLowerCase().includes('depo')) {
+            fallbackType = 'deposit';
+          } else if (text.toLowerCase().includes('withdraw') || text.toLowerCase().includes('wd')) {
+            fallbackType = 'withdraw';  
+          } else if (text.toLowerCase().includes('promo') || text.toLowerCase().includes('bonus')) {
+            fallbackType = 'promo';
+          } else if (isShortMessage) {
+            fallbackType = 'short';
+          } else if (isLongMessage) {
+            fallbackType = 'detailed';
+          }
+          
+          // Smart fallback responses based on context
+          const fallbackResponses = {
+            welcome: process.env.BOT_WELCOME_MESSAGE || 'Halo bosku! Ada yang bisa saya bantu?',
+            deposit: 'Untuk bantuan deposit, boleh minta User ID-nya bosku? Kami akan segera cek untuk Anda.',
+            withdraw: 'Untuk cek status withdrawal, boleh minta User ID-nya bosku? Kami akan segera cek untuk Anda.',
+            promo: 'Ada beberapa promo menarik yang tersedia bosku! Boleh minta User ID untuk info promo yang cocok?',
+            short: 'Ada yang bisa saya bantu bosku? 😊',
+            detailed: 'Terima kasih atas informasinya bosku. Kami akan bantu proseskan. Mohon tunggu sebentar ya.',
+            standard: 'Terima kasih bosku, kami terima pesannya dan akan segera diproses.'
+          };
+          
+          finalText = fallbackResponses[fallbackType];
+          console.log(`🔄 Using enhanced fallback response (${fallbackType}): "${finalText}"`);
+          
+        } catch(_) { 
+          finalText = 'Terima kasih atas pesannya.'; 
+          console.log('🔄 Using basic fallback due to database error');
+        }
+      }
+      
+      console.log('🤖 ===== AI RESPONSE READY =====');
+      console.log(`📝 Response: "${finalText}"`);
+      console.log(`📊 Length: ${finalText.length} characters`);
+      console.log(`⏱️  Total processing time: ${Date.now() - processingStartTime}ms`);
+      
+      // Real-time performance tracking and monitoring
+      const totalProcessingTime = Date.now() - processingStartTime;
+      const performanceMetrics = {
+        aiTime: aiProcessingTime || 0,
+        totalTime: totalProcessingTime,
+        messageLength: text.length,
+        responseLength: finalText.length,
+        chatId: messageChatId,
+        timestamp: new Date().toISOString(),
+        hasAiResponse: !!(reply && reply.trim()),
+        fallbackUsed: !(reply && reply.trim())
+      };
+      
+      // Log performance warnings for monitoring
+      if (totalProcessingTime > 10000) {
+        console.warn('⚠️ SLOW RESPONSE WARNING: Total processing exceeded 10 seconds');
+      } else if (totalProcessingTime > 5000) {
+        console.warn('⚠️ Response time above 5 seconds - consider optimization');
+      } else if (totalProcessingTime < 1000) {
+        console.log('⚡ FAST RESPONSE: Under 1 second total processing time');
+      }
+      
+      // Store performance metrics for real-time analytics
+      try {
+        if (!global.__performanceMetrics) global.__performanceMetrics = [];
+        global.__performanceMetrics.push(performanceMetrics);
+        
+        // Keep only last 100 metrics in memory for dashboard
+        if (global.__performanceMetrics.length > 100) {
+          global.__performanceMetrics = global.__performanceMetrics.slice(-100);
+        }
+      } catch(e) {
+        console.warn('Failed to store performance metrics:', e.message);
+      }
+      
+      const sendEval = evaluateChatIdForSend(messageChatId, req, payload);
+  let webhookSendSucceeded = false;
+  let persistedSignatureState = false;
+      const replyContext = {
+        chat_id: messageChatId,
+        chat: payload?.chat,
+        event: eventPayload,
+        thread: payload?.thread,
+        group_id: payload?.group_id || payload?.chat?.group_id || null
+      };
+      let replyMapping = { lcGroupId: null, internalGroupId: null };
+      try {
+        const mapped = await mapChatToGroup(replyContext);
+        if (mapped) {
+          replyMapping = mapped;
+        }
+      } catch (err) {
+        console.warn('Reply mapping failed', { chatId: messageChatId, error: err?.message || err });
+      }
+
+      if (sendEval.skip) {
+        console.log('🚫 Skipping LiveChat send (local/test detected)', {
+          chatId: messageChatId,
+          reason: sendEval.reason,
+          match: sendEval.match || null,
+          allowOverride: sendEval.allowFake
+        });
+        console.log('🤖 ===================================\n');
+        webhookDedupeKeys.forEach((key) => removeDuplicateEvent(key));
+        if (previousEventId !== null) {
+          try { await updateLastCustomerEventId(messageChatId, previousEventId); } catch(_) {}
+        }
+      } else {
+        try {
+          const dbForUpdate = dbForChatState || await getDb();
+          const updatedAutoAiState = Object.assign({}, autoAiStateSnapshot || {}, {
+            lastCustomerSignature: customerSignature.signature,
+            lastCustomerSignatureAt: Date.now(),
+            lastCustomerAuthor: customerSignature.normalizedAuthor,
+            lastCustomerTextPreview: customerSignature.normalizedText.slice(0, 160)
+          });
+          const chatStatePayload = Object.assign({}, chatStateSnapshot || {});
+          chatStatePayload.__autoAi = updatedAutoAiState;
+          try {
+            await updateChatState(dbForUpdate, messageChatId, chatStatePayload);
+            persistedSignatureState = true;
+          } catch (persistErr) {
+            console.warn('Non-fatal: failed to persist customer signature before send', persistErr?.message || persistErr);
+          }
+
+          await sendReply(replyContext, finalText, {
+            internalGroupId: replyMapping.internalGroupId,
+            groupId: replyMapping.lcGroupId
+          });
+          webhookSendSucceeded = true;
+          console.log(`✅ Bot reply sent to LiveChat successfully!`);
+          console.log(`📱 Chat ID: ${messageChatId}`);
+          console.log(`💬 Sent: "${finalText}"`);
+          if (replyMapping.lcGroupId) {
+            console.log(`🏷️ LiveChat Group: ${replyMapping.lcGroupId}`);
+          }
+          console.log('🤖 ===================================\n');
+        } catch (e) {
+          console.error('❌ Failed sending bot reply to LiveChat:', e?.response?.data || e.message);
+          if (persistedSignatureState) {
+            try {
+              const dbForRollback = dbForChatState || await getDb();
+              const revertStatePayload = Object.assign({}, chatStateSnapshot || {});
+              if (autoAiStateBeforeUpdate) {
+                revertStatePayload.__autoAi = autoAiStateBeforeUpdate;
+              } else if (Object.prototype.hasOwnProperty.call(revertStatePayload, '__autoAi')) {
+                delete revertStatePayload.__autoAi;
+              }
+              await updateChatState(dbForRollback, messageChatId, revertStatePayload);
+            } catch (rollbackErr) {
+              console.warn('Non-fatal: failed to roll back customer signature state', rollbackErr?.message || rollbackErr);
+            }
+          }
+          webhookDedupeKeys.forEach((key) => removeDuplicateEvent(key));
+          if (previousEventId !== null) {
+            try { await updateLastCustomerEventId(messageChatId, previousEventId); } catch(_) {}
+          }
+          console.log('🤖 ===================================\n');
+        }
+      }
+
+      if (webhookSendSucceeded) {
+        try {
+          const dbi2 = await getDb();
+          await addMessage(dbi2, messageChatId, 'assistant', finalText);
+          console.log('🗄️ Stored assistant reply', { chatId: messageChatId, len: finalText.length });
+        } catch (e) {
+          console.warn('Failed storing assistant reply', e?.message || e);
+        }
+
+        webhookDedupeKeys.forEach((key) => markAutoAiEventProcessed(messageChatId, key));
+
+        rememberAssistantMessage(messageChatId, finalText, { senderId: 'webhook-auto' });
+        trackMessage(messageChatId, 'assistant');
+
+        // Update chat ticket status to in_progress after bot replies
+        try { await setChatStatus(messageChatId, 'in_progress'); } catch(_) {}
+
+        // AFTER AI reply, evaluate if escalation to human support is required
+        try {
+          const evt = detectSupportEvent(text);
+          if (evt) {
+            if (!global.__lastSupportPingByChat) global.__lastSupportPingByChat = new Map();
+            const map = global.__lastSupportPingByChat;
+            const key = `${chatId}:${evt.type}`;
+            const nowTs = Date.now();
+            const lastPing = map.get(key) || 0;
+            const minIntervalMs = parseInt(process.env.SUPPORT_PING_MIN_INTERVAL_MS || '180000', 10); // default 3 minutes
+            if (nowTs - lastPing >= minIntervalMs) {
+              createSupportPing({
+                type: evt.type,
+                chatId,
+                userId: 'livechat',
+                amount: evt.amount || null,
+                language: 'id',
+                message: text
+              });
+              map.set(key, nowTs);
+              console.log(`📣 Support ping created for chat ${chatId} (reason: ${evt.type})`);
+              // Reflect needs_human in persisted status
+              try { await setChatStatus(chatId, 'needs_human'); } catch(_) {}
+            } else {
+              console.log(`🕒 Skipping support ping (cooldown) chat=${chatId} reason=${evt.type}`);
+            }
+          }
+        } catch (e) {
+          console.warn('Support escalation check failed (non-fatal):', e?.message || e);
+        }
+      }
+    } catch (err) {
+      console.error('Error processing webhook:', err.response?.data || err.message);
+    }
+  });
+});
+
+// Diagnostic: analyze why a bot reply may not have been sent
+app.get('/api/livechat/diagnose/:chatId', async (req, res) => {
+  if (!requireBotSecret(req, res)) return; // allow JWT
+  const { chatId } = req.params;
+  try {
+    const threads = await livechatPost('/agent/action/list_threads', { chat_id: chatId }, {});
+    if (!threads.ok) return res.status(threads.status).json({ success:false, error: threads.error, details: threads.raw });
+    const threadList = threads.data?.threads || threads.data?.data?.threads || [];
+    const events = threadList.flatMap(t => t.events || []);
+    const messages = events.filter(e => e.type === 'message');
+    const lastMsg = messages[messages.length - 1];
+    let reason = 'unknown';
+    if (!lastMsg) reason = 'no_messages';
+    else if (!lastMsg.author_id) reason = 'last_event_no_author_id';
+    else if (/agent|bot/i.test(lastMsg.author_id)) reason = 'last_message_already_agent_or_bot';
+    else {
+      // Check cooldown condition
+      const cooldownMs = parseInt(process.env.LIVECHAT_REPLY_COOLDOWN_MS || '3000', 10);
+      const lastTs = global.__lastReplyByChat?.get(chatId) || 0;
+      const since = Date.now() - lastTs;
+      if (since < cooldownMs) reason = 'cooldown_active'; else reason = 'should_have_replied';
+    }
+    res.json({ success:true, chatId, reason, lastMessageAuthor: lastMsg?.author_id || null, lastMessageText: lastMsg?.text || null, eventCount: events.length });
+  } catch (e) {
+    res.status(500).json({ success:false, error: e.message });
+  }
+});
+
+// Manual test endpoint to force a bot reply to a given chat (owner/master only or BOT_SECRET)
+app.post('/api/livechat/bot/reply', async (req, res) => {
+  if (!requireBotSecret(req, res)) return; // allow JWT or secret
+  try {
+    const { chatId, message } = req.body || {};
+    if (!chatId) return res.status(400).json({ success: false, error: 'chatId required' });
+    const userMsg = message || 'hello';
+    gcGetChatState(chatId);
+    const reply = await gcGetResponse(chatId, userMsg, `${chatId}_${Date.now()}`);
+    const finalText = (reply && reply.trim()) ? reply.trim() : 'Thanks for your message.';
+    const groupMapping = await getChatGroup(chatId);
+    const internalGroupId = groupMapping ? (groupMapping.group_id ?? groupMapping.groupId ?? null) : null;
+    const lcGroupId = internalGroupId ? await getGroupLivechatGroupId(internalGroupId) : null;
+    let sent = false;
+    try {
+      await sendReply(
+        {
+          chat_id: chatId,
+          chat: { id: chatId, group_id: lcGroupId }
+        },
+        finalText,
+        {
+          internalGroupId,
+          groupId: lcGroupId
+        }
+      );
+      sent = true;
+    } catch (e) {
+      return res.status(502).json({ success: false, error: 'Failed to send via LiveChat', details: e?.response?.data || e.message, reply: finalText });
+    }
+  try { const dbi2 = await getDb(); await addMessage(dbi2, chatId, 'assistant', finalText); console.log('🗄️ Stored assistant reply (manual endpoint)', { chatId, len: finalText.length }); } catch (e) { console.warn('Failed storing assistant reply (manual endpoint)', e?.message || e); }
+    res.json({ success: true, chatId, sent, reply: finalText });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Manual: force proactive welcome if none sent yet
+app.post('/api/livechat/bot/welcome', async (req, res) => {
+  if (!requireBotSecret(req, res)) return;
+  try {
+    const { chatId } = req.body || {};
+    if (!chatId) return res.status(400).json({ success:false, error:'chatId required' });
+    const dbi = await getDb();
+    const existing = dbi.prepare('SELECT 1 FROM messages WHERE chat_id = ? AND role = ? LIMIT 1').get(chatId, 'assistant');
+    if (existing) return res.json({ success:true, skipped:true, reason:'assistant message already exists' });
+    const welcome = process.env.BOT_WELCOME_MESSAGE || 'Halo bosku! Ada yang bisa saya bantu?';
+    const groupMapping = await getChatGroup(chatId);
+    const internalGroupId = groupMapping ? (groupMapping.group_id ?? groupMapping.groupId ?? null) : null;
+    const lcGroupId = internalGroupId ? await getGroupLivechatGroupId(internalGroupId) : null;
+    try {
+      await sendReply(
+        {
+          chat_id: chatId,
+          chat: { id: chatId, group_id: lcGroupId }
+        },
+        welcome,
+        {
+          internalGroupId,
+          groupId: lcGroupId
+        }
+      );
+    } catch(e) { return res.status(502).json({ success:false, error:'send_failed', details: e?.response?.data || e.message }); }
+    try { await addMessage(dbi, chatId, 'assistant', welcome); } catch(_) {}
+    res.json({ success:true, sent:true, chatId, welcome });
+  } catch(e) { res.status(500).json({ success:false, error:e.message }); }
+});
+
+// REMOVED: Global Auto AI polling endpoint - now using webhook-based responses only
+// The /api/livechat/bot/attend endpoint has been completely removed to disable polling functionality
+
+// Global Auto AI state management
+app.get('/api/auto-ai/global', auth.authMiddleware(), async (req, res) => {
+
+    const createdAt = createdAtRaw ?? createdAtSnake ?? timestampRaw ?? null;
+    const { normalizedEventId, fingerprint } = buildEventIdentity(chatId, eventId, { text, authorId, createdAt });
+    const dedupeKeys = Array.from(new Set([normalizedEventId, fingerprint].filter(Boolean)));
+    const eventKey = dedupeKeys[0];
+    const handledSignature = buildMessageSignature(chatId, normalizedEventId, text);
+
+    const autoState = await getGlobalAutoAiState();
+    const currentUserId = Number(req.user.id);
+    const lockedByOther = autoState.enabled && autoState.lockedByUserId != null && autoState.lockedByUserId !== currentUserId;
+    if (!autoState.enabled) {
+      return res.status(409).json({ success: false, error: 'global_auto_ai_disabled', state: autoState });
+    }
+    if (lockedByOther && req.user.role !== 'owner') {
+      return res.status(409).json({ success: false, error: 'global_auto_ai_locked', state: autoState });
+    }
+
+    console.log('🛰️ Global Auto AI request', {
+      chatId,
+      eventId: normalizedEventId || null,
+      userId: currentUserId,
+      role: req.user.role,
+      email: req.user.email,
+      scope: scope || null,
+      authorType: authorType || null
+    });
+
+    const normalizedAuthorType = authorType ? String(authorType).toLowerCase() : null;
+    if (normalizedAuthorType && normalizedAuthorType !== 'customer') {
+      console.log('🛑 Skipping Global Auto AI attend for non-customer event', {
+        chatId,
+        eventId: normalizedEventId || null,
+        authorType: normalizedAuthorType
+      });
+      return res.json({ success: true, skipped: true, reason: 'non_customer_event' });
+    }
+
+    if (dedupeKeys.some((key) => hasProcessedAutoAiEvent(chatId, key))) {
+      console.log('🛑 Already processed (memory cache)', { chatId, keys: dedupeKeys });
+      return res.json({ success: true, skipped: true, reason: 'duplicate_event' });
+    }
+
+    if (isDuplicateEvent(eventKey)) {
+      console.log('🛑 Duplicate event detected (UI)', { chatId, eventId: eventKey });
+      return res.json({ success: true, skipped: true, reason: 'duplicate_event' });
+    }
+
+    if (handledSignature && hasHandledMessage(chatId, handledSignature)) {
+      console.log('🛑 Handled signature already processed (UI)', { chatId, eventId: eventKey });
+      return res.json({ success: true, skipped: true, reason: 'already_processed' });
+    }
+
+    const previousEventId = await getLastCustomerEventId(chatId);
+    if (previousEventId && previousEventId === normalizedEventId) {
+      console.log('🛑 Event matches stored last_customer_event_id offset (Global Auto AI)', { chatId, eventId: normalizedEventId });
+      dedupeKeys.forEach((key) => markAutoAiEventProcessed(chatId, key));
+      return res.json({ success: true, skipped: true, reason: 'offset_match' });
+    }
+    if (previousEventId && dedupeKeys.includes(previousEventId)) {
+      console.log('🛑 Event already processed for chat (DB lock)', { chatId, eventId: eventKey });
+      return res.json({ success: true, skipped: true, reason: 'event_already_processed' });
+    }
+
+    // Check persistent customer message signature to deduplicate across webhook variants
+    let customerSignature = null;
+    let persistedSignatureState = false;
+    if (text && authorId) {
+      customerSignature = buildCustomerMessageSignature(chatId, text, authorId);
+      const dbForState = await getDb();
+      const stateObj = await getChatState(dbForState, chatId) || {};
+      const previousSignature = stateObj.__autoAi && stateObj.__autoAi.lastCustomerSignature;
+      
+      if (previousSignature && previousSignature === customerSignature.signature) {
+        console.log('🛑 Customer message signature already processed (Global Auto AI)', { chatId, signature: customerSignature.signature });
+        dedupeKeys.forEach((key) => markAutoAiEventProcessed(chatId, key));
+        return res.json({ success: true, skipped: true, reason: 'signature_duplicate' });
+      }
+      
+      console.log('✅ Customer signature check passed (Global Auto AI)', { 
+        chatId, 
+        newSignature: customerSignature.signature.slice(0, 8),
+        previousSignature: previousSignature ? previousSignature.slice(0, 8) : 'none'
+      });
+    }
+
+    if (!normalizedAuthorType && authorId && (String(authorId).toLowerCase().includes('agent') || String(authorId).toLowerCase().includes('bot'))) {
+      console.log('⏭️ Skipping agent/bot message');
+      return res.json({ success: true, skipped: true, reason: 'agent_message' });
+    }
+
+    try {
+      await updateChatActivity(chatId, 'ui');
+      const dbInbound = await getDb();
+      await addMessage(dbInbound, chatId, 'user', text);
+      trackMessage(chatId, 'user');
+    } catch (e) {
+      console.warn('UI bot attend: failed to persist incoming message', e?.message || e);
+    }
+
+    if (hasExceededMessageRatio(chatId)) {
+      removeDuplicateEvent(eventKey);
+      return res.json({
+        success: true,
+        skipped: true,
+        reason: 'message_ratio_exceeded',
+        counts: global.__messageCountsByChat.get(chatId) || { user: 0, assistant: 0 }
+      });
+    }
+
+    // IMPORTANT: Check if we're already processing this chat to prevent duplicate responses
+    const processingKey = `globalai:${chatId}`;
+    if (activeChatLocks.has(processingKey)) {
+      console.log('🛑 Global Auto AI already processing this chat, skipping duplicate request', { chatId });
+      return res.json({ success: true, skipped: true, reason: 'already_processing' });
+    }
+    
+    // Lock this chat for processing
+    activeChatLocks.add(processingKey);
+    
+    try {
+      markHandledMessage(chatId, handledSignature);
+      await updateLastCustomerEventId(chatId, eventKey);
+
+      gcGetChatState(chatId);
+      let reply = null;
+      try {
+        reply = await gcGetResponse(chatId, text, eventKey, groupId);
+      } catch (err) {
+        clearHandledMessage(chatId, handledSignature);
+        await updateLastCustomerEventId(chatId, previousEventId || null);
+        removeDuplicateEvent(eventKey);
+        activeChatLocks.delete(processingKey);
+        console.error('UI bot attend: gcGetResponse failed', err?.message || err);
+        return res.status(502).json({ success: false, error: 'Failed to generate reply', details: err?.message || err });
+      }
+
+      let finalText = (reply && reply.trim()) ? reply.trim() : '';
+      if (!finalText) {
+        console.log('⚠️ AI returned empty response for Global Auto AI (attend endpoint). Skipping send, escalating to human.');
+        
+        // Mark for human escalation AND store signature to prevent retry spam
+        try {
+          const dbForState = await getDb();
+          const stateObj = await getChatState(dbForState, chatId) || {};
+          if (!stateObj.__autoAi) stateObj.__autoAi = {};
+          stateObj.__autoAi.needsHumanReview = true;
+          stateObj.__autoAi.emptyAiResponseAt = new Date().toISOString();
+          
+          // Store signature even when skipping send to prevent retry spam
+          if (customerSignature) {
+            stateObj.__autoAi.lastCustomerSignature = customerSignature.signature;
+            stateObj.__autoAi.lastCustomerSignatureAt = Date.now();
+            stateObj.__autoAi.lastCustomerAuthor = customerSignature.normalizedAuthor;
+            stateObj.__autoAi.lastCustomerTextPreview = customerSignature.normalizedText.slice(0, 160);
+            console.log('✅ Stored signature for empty response (prevent retry spam)', { 
+              chatId, 
+              signature: customerSignature.signature.slice(0, 8) 
+            });
+          }
+          
+          await updateChatState(dbForState, chatId, stateObj);
+        } catch (escalateErr) {
+          console.warn('⚠️ Non-fatal: failed to mark for human escalation', escalateErr?.message || escalateErr);
+        }
+        
+        // Mark as processed and return WITHOUT sending
+        dedupeKeys.forEach((key) => markAutoAiEventProcessed(chatId, key));
+        await updateLastCustomerEventId(chatId, normalizedEventId);
+        clearHandledMessage(chatId, handledSignature);
+        removeDuplicateEvent(eventKey);
+        activeChatLocks.delete(processingKey);
+        
+        return res.json({ success: true, skipped: true, reason: 'empty_ai_response' });
+      }
+
+      const senderMeta = { senderId: `ui-auto:${currentUserId || 'unknown'}` };
+      if (shouldSkipAssistantMessage(chatId, finalText, senderMeta)) {
+        clearHandledMessage(chatId, handledSignature);
+        await updateLastCustomerEventId(chatId, previousEventId || null);
+        removeDuplicateEvent(eventKey);
+        activeChatLocks.delete(processingKey);
+        return res.json({ success: true, skipped: true, reason: 'assistant_recent_duplicate' });
+      }
+
+      // IMPORTANT: Remember this response BEFORE sending to prevent concurrent duplicates
+      rememberAssistantMessage(chatId, finalText, senderMeta);
+      trackMessage(chatId, 'assistant');
+
+      const requestedGroupId = groupId != null ? Number(groupId) : null;
+      const existingMapping = await getChatGroup(chatId);
+      const internalGroupId = requestedGroupId != null
+        ? requestedGroupId
+        : (existingMapping ? Number(existingMapping.group_id ?? existingMapping.groupId ?? existingMapping) : null);
+      const livechatGroupId = internalGroupId ? await getGroupLivechatGroupId(internalGroupId) : null;
+
+      let sent = false;
+      try {
+        await sendReply(
+          {
+            chat_id: chatId,
+            chat: { id: chatId, group_id: livechatGroupId },
+            event: { group_id: livechatGroupId }
+          },
+          finalText,
+          {
+            internalGroupId,
+            groupId: livechatGroupId
+          }
+        );
+        sent = true;
+        console.log(`UI bot attend reply sent to ${chatId}: ${finalText}`);
+      } catch (sendErr) {
+        clearHandledMessage(chatId, handledSignature);
+        await updateLastCustomerEventId(chatId, previousEventId || null);
+        removeDuplicateEvent(eventKey);
+        activeChatLocks.delete(processingKey);
+        return res.status(502).json({ success: false, error: 'Failed to send via LiveChat', details: sendErr?.response?.data || sendErr.message, reply: finalText });
+      }
+
+    try {
+      const dbOut = await getDb();
+      await addMessage(dbOut, chatId, 'assistant', finalText);
+    } catch (e) {
+      console.warn('UI bot attend: failed to persist assistant reply', e?.message || e);
+    }
+
+    try { await setChatStatus(chatId, 'in_progress'); } catch (_) {}
+
+    if (groupId != null) {
+      try {
+        const { setChatGroup } = require('./db-utils');
+        await setChatGroup(String(chatId), Number(groupId));
+      } catch (mapErr) {
+        console.warn('UI bot attend: failed to map chat to group', mapErr?.message || mapErr);
+      }
+    } else if (internalGroupId != null) {
+      try {
+        const { setChatGroup } = require('./db-utils');
+        await setChatGroup(String(chatId), Number(internalGroupId));
+      } catch (mapErr) {
+        console.warn('UI bot attend: failed to persist inferred chat→group mapping', mapErr?.message || mapErr);
+      }
+    }
+
+    // Store customer signature AFTER successful send to prevent duplicate processing
+    if (customerSignature && sent) {
+      try {
+        const dbForState = await getDb();
+        const stateObj = await getChatState(dbForState, chatId) || {};
+        const updatedAutoAiState = Object.assign({}, stateObj.__autoAi || {}, {
+          lastCustomerSignature: customerSignature.signature,
+          lastCustomerSignatureAt: Date.now(),
+          lastCustomerAuthor: customerSignature.normalizedAuthor,
+          lastCustomerTextPreview: customerSignature.normalizedText.slice(0, 160)
+        });
+        stateObj.__autoAi = updatedAutoAiState;
+        await updateChatState(dbForState, chatId, stateObj);
+        persistedSignatureState = true;
+        console.log('✅ Stored customer signature after successful send (Global Auto AI)', { 
+          chatId, 
+          signature: customerSignature.signature.slice(0, 8) 
+        });
+      } catch (persistErr) {
+        console.warn('⚠️ Non-fatal: failed to persist customer signature after send', persistErr?.message || persistErr);
+      }
+    }
+
+      dedupeKeys.forEach((key) => markAutoAiEventProcessed(chatId, key));
+
+      res.json({ success: true, chatId, sent, reply: finalText, eventId: eventKey, state: autoState });
+    } finally {
+      // Always release the lock
+      activeChatLocks.delete(processingKey);
+    }
+// ... (function body removed)
+// });
+
+// Global Auto AI state management
+app.get('/api/auto-ai/global', auth.authMiddleware(), async (req, res) => {
+  try {
+  const state = await getGlobalAutoAiState();
+  global.__globalAutoAiState = Object.assign({}, global.__globalAutoAiState, state || {});
+  // Agent Chat Manager remains enabled for webhook-based responses
+    res.json({ success: true, state });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post('/api/auto-ai/global', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (!(req.user.role === 'owner' || req.user.role === 'master')) {
+      return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+
+    const desiredEnabled = !!req.body?.enabled;
+    const scope = req.body?.scope || null;
+    const now = new Date().toISOString();
+    const currentState = await getGlobalAutoAiState();
+    const currentUserId = Number(req.user.id);
+
+    if (desiredEnabled) {
+      // If already enabled by another user, only owner can override
+      if (currentState.enabled && currentState.lockedByUserId != null && currentState.lockedByUserId !== currentUserId) {
+        if (req.user.role !== 'owner') {
+          return res.status(409).json({ success: false, error: 'already_locked', state: currentState });
+        }
+        console.warn('⚠️ Owner overriding Global Auto AI lock from', currentState.lockedByEmail || currentState.lockedByUserId);
+      }
+
+      const nextState = await setGlobalAutoAiState({
+        enabled: true,
+        lockedByUserId: currentUserId,
+        lockedByEmail: req.user.email || null,
+        lockedByRole: req.user.role,
+        lockedScope: scope || currentState.lockedScope || null,
+        lockedAt: now
+      });
+      global.__globalAutoAiState = nextState;
+      // Agent Chat Manager remains enabled for webhook-based responses
+      console.log('🔒 Global Auto AI enabled', nextState);
+      return res.json({ success: true, state: nextState });
+    }
+
+    // Disable flow requires same user or owner override
+    if (currentState.lockedByUserId != null && currentState.lockedByUserId !== currentUserId && req.user.role !== 'owner') {
+      return res.status(409).json({ success: false, error: 'locked_by_other_user', state: currentState });
+    }
+
+    const resetState = await setGlobalAutoAiState({
+      enabled: false,
+      lockedByUserId: null,
+      lockedByEmail: null,
+      lockedByRole: null,
+      lockedScope: null,
+      lockedAt: now
+    });
+    global.__globalAutoAiState = resetState;
+    // Agent Chat Manager remains enabled for webhook-based responses
+    console.log('🔓 Global Auto AI disabled by', req.user.email || currentUserId);
+    return res.json({ success: true, state: resetState });
+  } catch (e) {
+    console.error('Failed updating Global Auto AI state', e?.message || e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// --- Admin: Clear chats and tickets (Owner only) ---
+app.post('/api/admin/clear', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const db = await getDb();
+    let deletedChats = 0, deletedMessages = 0, deletedChatGroups = 0;
+    const tx = db.transaction(() => {
+      try { const info = db.prepare('DELETE FROM messages').run(); deletedMessages = info.changes || 0; } catch(_) {}
+      try { const info = db.prepare('DELETE FROM chats').run(); deletedChats = info.changes || 0; } catch(_) {}
+      try { const info = db.prepare('DELETE FROM chat_groups').run(); deletedChatGroups = info.changes || 0; } catch(_) {}
+    });
+    tx();
+    // Clear in-memory support pings and activity maps if present
+    try {
+      if (Array.isArray(supportPings)) { supportPings.length = 0; }
+      if (global.__lastSupportPingByChat) global.__lastSupportPingByChat = new Map();
+      if (global.__lastReplyByChat) global.__lastReplyByChat = new Map();
+    } catch(_) {}
+    res.json({ success: true, deleted: { chats: deletedChats, messages: deletedMessages, chatGroups: deletedChatGroups } });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ---- Chat status APIs ----
+// Get status for one or many chatIds (?ids=a,b,c) -> { map: {id: status} }
+app.get('/api/chat-status', auth.authMiddleware(), async (req, res) => {
+  try {
+    const idsRaw = String(req.query.ids || '').trim();
+    if (!idsRaw) return res.json({ success: true, map: {} });
+    const ids = idsRaw.split(',').map(s => s.trim()).filter(Boolean);
+    const map = await getChatStatusMap(ids);
+    res.json({ success: true, map });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Set status for a chat: body { status: 'in_progress'|'completed'|'needs_human' }
+app.put('/api/chat/:id/status', auth.authMiddleware(), async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    const status = String(req.body?.status || '').trim();
+    if (!id || !status) return res.status(400).json({ success: false, error: 'id and status required' });
+    const s = await setChatStatus(id, status);
+    res.json({ success: true, id, status: s });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+
+// API endpoint to get dashboard stats
+app.get('/api/dashboard/stats', async (req, res) => {
+  try {
+    if (!db) throw new Error('Database not initialized');
+
+    const now = Math.floor(Date.now() / 1000);
+    const activeWindowSec = parseInt(process.env.DASHBOARD_ACTIVE_WINDOW_SEC || '900', 10); // default 15 minutes
+    const openWindowSec = parseInt(process.env.DASHBOARD_OPEN_WINDOW_SEC || '86400', 10); // default 24 hours
+    const sinceActive = now - activeWindowSec;
+    const sinceOpen = now - openWindowSec;
+    const groupIdParam = req.query.groupId ? Number(req.query.groupId) : null;
+
+    // Active users = distinct chats with a recent user message
+    let activeUsersRow;
+    if (groupIdParam) {
+      activeUsersRow = db.prepare(
+        'SELECT COUNT(DISTINCT m.chat_id) AS c FROM messages m JOIN chat_groups cg ON cg.chat_id = m.chat_id WHERE m.role = ? AND m.timestamp >= ? AND cg.group_id = ?'
+      ).get('user', sinceActive, groupIdParam);
+    } else {
+      activeUsersRow = db.prepare(
+        'SELECT COUNT(DISTINCT chat_id) AS c FROM messages WHERE role = ? AND timestamp >= ?'
+      ).get('user', sinceActive);
+    }
+  const activeUsersRaw = (activeUsersRow && activeUsersRow.c) ? activeUsersRow.c : 0;
+
+    // Open tickets = chats with recent activity
+    let openTicketsRow;
+    if (groupIdParam) {
+      openTicketsRow = db.prepare(
+        'SELECT COUNT(*) AS c FROM chats c JOIN chat_groups cg ON cg.chat_id = c.id WHERE c.last_activity >= ? AND cg.group_id = ?'
+      ).get(sinceOpen, groupIdParam);
+    } else {
+      openTicketsRow = db.prepare(
+        'SELECT COUNT(*) AS c FROM chats WHERE last_activity >= ?'
+      ).get(sinceOpen);
+    }
+  const openTickets = (openTicketsRow && openTicketsRow.c) ? openTicketsRow.c : 0;
+  // Fallback: if no recorded user messages yet (e.g., server restarted) but there are open tickets, approximate active users by open tickets
+  const activeUsers = (activeUsersRaw === 0 && openTickets > 0) ? openTickets : activeUsersRaw;
+
+    // AI responses count (assistant messages)
+    let aiRespRow;
+    if (groupIdParam) {
+      aiRespRow = db.prepare(
+        `SELECT COUNT(*) AS c
+         FROM messages m
+         JOIN chat_groups cg ON cg.chat_id = m.chat_id
+         WHERE m.role = 'assistant' AND cg.group_id = ?`
+      ).get(groupIdParam);
+    } else {
+      aiRespRow = db.prepare(
+        `SELECT COUNT(*) AS c
+         FROM messages WHERE role = 'assistant'`
+      ).get();
+    }
+    const aiResponses = (aiRespRow && aiRespRow.c) ? aiRespRow.c : 0;
+
+    // Total tickets (chats) received lifetime
+    let totalTicketsRow;
+    if (groupIdParam) {
+      totalTicketsRow = db.prepare(
+        `SELECT COUNT(*) AS c FROM chat_groups WHERE group_id = ?`
+      ).get(groupIdParam);
+    } else {
+      totalTicketsRow = db.prepare(`SELECT COUNT(*) AS c FROM chats`).get();
+    }
+    const totalTickets = (totalTicketsRow && totalTicketsRow.c) ? totalTicketsRow.c : 0;
+
+    // Token usage totals (owner-focused metric)
+    let tokenTotals = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+    try {
+      const { getAiUsageTotals } = require('./db-utils.js');
+      tokenTotals = await getAiUsageTotals({ since: null, groupId: groupIdParam || null });
+    } catch (_) {}
+
+    console.log('📊 Dashboard stats computed', { activeUsers, activeUsersRaw, openTickets, aiResponses, totalTickets, sinceActive, sinceOpen });
+    res.json({ success: true, activeUsers, openTickets, aiResponses, totalTickets, tokenTotals, timestamp: Date.now(), rawActiveUsers: activeUsersRaw });
+  } catch (error) {
+    console.error('Error getting dashboard stats:', error);
+    res.status(500).json({ success: false, error: 'Failed to get dashboard stats' });
+  }
+});
+
+// Owner-only: AI usage totals with optional filters (?sinceMs=..&groupId=..)
+app.get('/api/admin/ai-usage', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const sinceMs = req.query.sinceMs ? Number(req.query.sinceMs) : null;
+    const groupId = req.query.groupId ? Number(req.query.groupId) : null;
+    const { getAiUsageTotals } = require('./db-utils.js');
+    const totals = await getAiUsageTotals({ since: sinceMs, groupId });
+    res.json({ success: true, totals });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Owner-only: Reset AI token usage to 0
+app.post('/api/admin/reset-tokens', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const dbi = await getDb();
+    // Delete all records from ai_usage table
+    const result = dbi.prepare('DELETE FROM ai_usage').run();
+    console.log(`🔄 AI token usage reset by user ${req.user.id} (${req.user.email}). Deleted ${result.changes} records.`);
+    res.json({ success: true, message: 'AI token usage reset to 0', deletedRecords: result.changes });
+  } catch (e) {
+    console.error('Error resetting AI token usage:', e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Admin: Agent activity logs (owner/master)
+// Query params: sinceMs (optional), agentId (optional), limit (default 100)
+app.get('/api/admin/agent-activity', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (!(req.user.role === 'owner' || req.user.role === 'master')) {
+      return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+    const dbi = await getDb();
+    const sinceMs = req.query.sinceMs ? Number(req.query.sinceMs) : null;
+    const agentId = req.query.agentId ? Number(req.query.agentId) : null;
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit || 100)));
+
+    let sql = `SELECT l.id, l.user_id, u.email, l.chat_id, l.action, l.details, l.timestamp
+               FROM agent_logs l
+               JOIN users u ON u.id = l.user_id
+               WHERE u.role = 'agent'`;
+    const params = [];
+    if (sinceMs) { sql += ' AND l.timestamp >= ?'; params.push(Math.floor(sinceMs / 1000)); }
+    if (agentId) { sql += ' AND l.user_id = ?'; params.push(agentId); }
+
+    if (req.user.role === 'master') {
+      const allowed = await auth.getMasterGroups(req.user.id);
+      const allowedIds = new Set((allowed || []).map(g => g.id));
+      if (allowedIds.size === 0) return res.json({ success: true, logs: [] });
+      const rows = dbi.prepare(`SELECT DISTINCT ag.user_id AS agent_id
+                                FROM agent_groups ag
+                                WHERE ag.group_id IN (${Array.from(allowedIds).map(()=>'?').join(',')})`).all(...Array.from(allowedIds));
+      const allowedAgentIds = new Set(rows.map(r => r.agent_id));
+      sql += ' ORDER BY l.id DESC LIMIT ?'; params.push(limit);
+      const raw = dbi.prepare(sql).all(...params);
+      const logs = raw.filter(r => allowedAgentIds.has(r.user_id) || r.user_id === req.user.id)
+        .map(r => ({ id: r.id, userId: r.user_id, email: r.email, chatId: r.chat_id, action: r.action, details: safeParse(r.details), timestamp: r.timestamp }));
+      return res.json({ success: true, logs });
+    }
+
+    sql += ' ORDER BY l.id DESC LIMIT ?'; params.push(limit);
+    const rows = dbi.prepare(sql).all(...params);
+    const logs = rows.map(r => ({ id: r.id, userId: r.user_id, email: r.email, chatId: r.chat_id, action: r.action, details: safeParse(r.details), timestamp: r.timestamp }));
+    res.json({ success: true, logs });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+function safeParse(jsonStr){ try { return jsonStr ? JSON.parse(jsonStr) : {}; } catch(_) { return {}; } }
+
+// Temporary debug: list recent user message rows (remove in production)
+app.get('/api/debug/messages', async (req, res) => {
+  try {
+    if (!db) return res.status(500).json({ success:false, error:'db not init'});
+    const rows = db.prepare('SELECT chat_id, role, content, timestamp FROM messages ORDER BY id DESC LIMIT 20').all();
+    res.json({ success:true, rows });
+  } catch (e) {
+    res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+// In-memory support ping store
+const supportPings = [];
+
+// Helper: create a support ping entry
+function createSupportPing({ type = 'deposit_check', chatId, userId, amount = null, language = 'id', message = '' }) {
+  if (!chatId || !userId) return;
+  const ping = {
+    id: Date.now() + '-' + Math.random().toString(36).slice(2, 8),
+    type,
+    chatId,
+    userId,
+    amount,
+    language,
+    message,
+    timestamp: Date.now(),
+  read: false,
+  resolved: false
+  };
+  supportPings.push(ping);
+  return ping;
+}
+
+// Helper: detect support-worthy events from a free-text message
+function detectSupportEvent(textRaw) {
+  if (!textRaw) return null;
+  const text = String(textRaw).toLowerCase();
+  
+  // Password reset
+  if (/reset\s*password|password\s*reset|forgot\s*password|lupa\s*(password|sandi)/i.test(text)) {
+    return { type: 'password_reset' };
+  }
+  // Deposit checking
+  if (/(deposit|setor|top\s*up|topup|dp\b|isi\s*saldo)/i.test(text)) {
+    return { type: 'deposit_check' };
+  }
+  // Account registration
+  if (/register|registration|signup|sign\s*up|daftar\s*akun|buat\s*akun/i.test(text)) {
+    return { type: 'account_registration' };
+  }
+  // Withdraw checking
+  if (/withdraw|wd\b|tarik\s*tunai|penarikan|pencairan/i.test(text)) {
+    // Try to capture an amount if present (e.g., 100, 100k, 1.5m, Rp 100.000)
+    const amountMatch = text.match(/(rp\s*)?([0-9][0-9\.,]*)\s*(k|m|jt)?/i);
+    return { type: 'withdraw_check', amount: amountMatch ? amountMatch[0] : null };
+  }
+  // Turnover inquiry
+  if (/turn\s*over|turnover|omset|rollover/i.test(text)) {
+    return { type: 'turnover' };
+  }
+  return null;
+}
+
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'web-chat.html'));
+});
+
+// Simple route to the GoodCasino web chat UI
+app.get('/web-chat', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'web-chat.html'));
+});
+
+// Public promotions page
+app.get('/promotions', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'promotions.html'));
+});
+
+// LiveChat API helper: prefer Basic auth (username/password or base64 PAT), fallback to Bearer
+const { getHeaderVariants } = require('./livechatAuth.js');
+async function livechatPost(path, body, { timeout = 15000 } = {}) {
+  const headerVariants = getHeaderVariants();
+  if (!headerVariants || headerVariants.length === 0) {
+    return { ok: false, error: 'LiveChat credentials not set', status: 401 };
+  }
+  let lastErr = null;
+  for (const headers of headerVariants) {
+    try {
+      const { data } = await axios.post(
+        `https://api.livechatinc.com/v3.5${path}`,
+        body,
+        { headers: { ...headers, 'Content-Type': 'application/json', Accept: 'application/json' }, timeout }
+      );
+      return { ok: true, data };
+    } catch (error) {
+      lastErr = error;
+      const status = error.response?.status;
+      // Only try next variant on auth errors
+      if (status === 401 || status === 403) {
+        continue;
+      }
+      break;
+    }
+  }
+  const msg = lastErr?.response?.data?.error?.message || lastErr?.message || 'Unknown error';
+  const code = lastErr?.response?.status || 500;
+  return { ok: false, error: msg, status: code, raw: lastErr?.response?.data };
+}
+
+// Import promotions module
+const { 
+  getPromotions, 
+  addPromotion, 
+  updatePromotion, 
+  deletePromotion,
+  formatPromotions
+} = require('./promotions.js');
+
+// Promotions API endpoints
+app.get('/api/promotions', async (req, res) => {
+  try {
+    const promotions = await getPromotions();
+    if (!promotions || promotions.length === 0) {
+      return res.json({ success: true, message: 'There are no active promotions at the moment.', promotions: [] });
+    }
+    res.json({ success: true, promotions });
+  } catch (error) {
+    console.error('Error getting promotions:', error);
+    res.status(500).json({ success: false, error: 'Failed to get promotions' });
+  }
+});
+
+app.post('/api/promotions', auth.authMiddleware(), async (req, res) => {
+  try {
+    // Permission: edit promotion
+    if (!auth.hasPermission(req.user, 'edit_promotion') && req.user.role !== 'master') {
+      return res.status(403).json({ success: false, error: 'No permission to edit promotions' });
+    }
+    const { 
+      title, 
+      description, 
+      discount, 
+      code,
+      timeLimit,
+      terms,
+      howToClaim,
+      eligibleItems,
+      eligibleGames,
+      endDate
+    } = req.body;
+    
+    if (!title || !description || discount === undefined) {
+      return res.status(400).json({ success: false, error: 'Missing required fields' });
+    }
+    
+    // Normalize eligible items/games
+    let elig = eligibleItems || eligibleGames || [];
+    if (typeof elig === 'string') {
+      elig = elig.split(',').map(s => s.trim()).filter(Boolean);
+    }
+    
+    // Normalize howToClaim to array or string
+    let how = howToClaim;
+    if (typeof how === 'string') {
+      // Split by newlines if a textarea string was sent
+      const arr = how.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+      how = arr.length ? arr : how.trim();
+    }
+
+    const promotionData = { 
+      title, 
+      description, 
+      discount: Number(discount), 
+      code: code || null,
+      timeLimit: timeLimit || null,
+      terms: terms || null,
+      howToClaim: how || null,
+      endDate: endDate || null,
+      // Store under both keys for compatibility with different consumers
+      eligibleItems: Array.isArray(elig) ? elig : [],
+      eligibleGames: Array.isArray(elig) ? elig : []
+    };
+    
+  const newPromotion = await addPromotion(promotionData);
+  // Log
+  await auth.logAgentAction(req.user.id, 'promotion_add', { title }, null);
+    res.status(201).json({ success: true, promotion: newPromotion });
+  } catch (error) {
+    console.error('Error adding promotion:', error);
+    res.status(500).json({ success: false, error: 'Failed to add promotion' });
+  }
+});
+
+app.put('/api/promotions/:id', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (!auth.hasPermission(req.user, 'edit_promotion') && req.user.role !== 'master') {
+      return res.status(403).json({ success: false, error: 'No permission to edit promotions' });
+    }
+    const { id } = req.params;
+    const updatesRaw = req.body || {};
+    // Normalize howToClaim if provided as string
+    const updates = { ...updatesRaw };
+    if (typeof updates.howToClaim === 'string') {
+      const arr = updates.howToClaim.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+      updates.howToClaim = arr.length ? arr : updates.howToClaim.trim();
+    }
+    const updated = await updatePromotion(Number(id), updates);
+    if (!updated) {
+      return res.status(404).json({ success: false, error: 'Promotion not found' });
+    }
+    await auth.logAgentAction(req.user.id, 'promotion_update', { id, updates }, null);
+    res.json({ success: true, promotion: updated });
+  } catch (error) {
+    console.error('Error updating promotion:', error);
+    res.status(500).json({ success: false, error: 'Failed to update promotion' });
+  }
+});
+
+app.delete('/api/promotions/:id', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (!auth.hasPermission(req.user, 'edit_promotion') && req.user.role !== 'master') {
+      return res.status(403).json({ success: false, error: 'No permission to delete promotions' });
+    }
+    const { id } = req.params;
+    const success = await deletePromotion(Number(id));
+    if (!success) {
+      return res.status(404).json({ success: false, error: 'Promotion not found' });
+    }
+    await auth.logAgentAction(req.user.id, 'promotion_delete', { id }, null);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error deleting promotion:', error);
+    res.status(500).json({ success: false, error: 'Failed to delete promotion' });
+  }
+});
+
+// RTP link persistence and endpoints
+const RTP_FILE = path.join(__dirname, 'rtp.json');
+let rtpLink = process.env.RTP_LINK || 'https://example.com/rtp';
+
+async function loadRtpLink() {
+  try {
+    const raw = await fs.readFile(RTP_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    if (data && typeof data.rtpLink === 'string' && data.rtpLink.trim()) {
+      rtpLink = data.rtpLink.trim();
+    }
+  } catch (_) {
+    // ignore, use default/env
+  }
+}
+
+async function saveRtpLink(newLink) {
+  const data = { rtpLink: newLink };
+  await fs.writeFile(RTP_FILE, JSON.stringify(data, null, 2), 'utf8');
+}
+
+// Load on startup
+loadRtpLink().catch(() => {});
+
+// RTP endpoints (JSON). Alias /api/trp provided for compatibility.
+app.get('/api/rtp', (req, res) => {
+  res.json({ success: true, rtpLink });
+});
+app.get('/api/trp', (req, res) => {
+  res.json({ success: true, rtpLink, note: 'alias of /api/rtp' });
+});
+app.post('/api/rtp', (req, res) => {
+  res.json({ success: true, rtpLink });
+});
+app.post('/api/trp', (req, res) => {
+  res.json({ success: true, rtpLink, note: 'alias of /api/rtp' });
+});
+app.put('/api/rtp', async (req, res) => {
+  try {
+    const { rtpLink: incoming } = req.body || {};
+    if (!incoming || typeof incoming !== 'string') {
+      return res.status(400).json({ success: false, error: 'rtpLink (string) is required' });
+    }
+    const trimmed = incoming.trim();
+    // Basic validation: must start with http(s)
+    if (!/^https?:\/\//i.test(trimmed)) {
+      return res.status(400).json({ success: false, error: 'rtpLink must start with http:// or https://'});
+    }
+    rtpLink = trimmed;
+    await saveRtpLink(rtpLink);
+    res.json({ success: true, rtpLink });
+  } catch (e) {
+    console.error('Failed to update RTP link:', e.message);
+    res.status(500).json({ success: false, error: 'Failed to update RTP link' });
+  }
+});
+
+// In-memory settings for templates and brand name (persisted to settings.json)
+let settings = {
+  brandName: 'Cekipos Payment Assistant',
+  welcomeMessage: 'Hello! I\'m here to help you with your Cekipos payment, bro. Can you share your CID?',
+  waitMessage: 'Alright boss, please wait while we check this for you 😊',
+  endMessage: 'Thank you boss, we wish you good luck! 😘'
+};
+const SETTINGS_FILE = path.join(__dirname, 'settings.json');
+async function loadSettingsFromFile() {
+  try {
+    const raw = await fs.readFile(SETTINGS_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    if (data && typeof data === 'object') {
+      settings = { ...settings, ...data };
+    }
+  } catch (e) {
+    if (e && e.code === 'ENOENT') {
+      try { await fs.writeFile(SETTINGS_FILE, JSON.stringify(settings, null, 2)); } catch (_) {}
+    }
+  }
+}
+async function saveSettingsToFile() {
+  try {
+    await fs.writeFile(SETTINGS_FILE, JSON.stringify(settings, null, 2));
+  } catch (e) {
+    console.error('Failed to persist settings.json:', e?.message || e);
+  }
+}
+loadSettingsFromFile().catch(() => {});
+
+// (Note) LiveChat send is handled via helper in livechatApi.js
+
+// Enhanced send-message endpoint with smart AI
+app.post('/send-message', async (req, res) => {
+  // Optional shared-secret protection for browser bridge
+  const requiredSecret = process.env.BOT_SECRET || '';
+  if (requiredSecret) {
+    const provided = req.headers['x-bot-secret'];
+    if (!provided || provided !== requiredSecret) {
+      return res.status(401).json({ success: false, error: 'Unauthorized' });
+    }
+  }
+  const { chatId, message, userId } = req.body;
+  
+  if (!chatId || !message) {
+    return res.status(400).json({ success: false, error: 'chatId and message are required' });
+  }
+  
+  // Lightweight detection for urgent support events to notify the dashboard
+  try {
+    const evt = detectSupportEvent(message);
+    if (evt) {
+      // Create a support ping for the dashboard (in-memory queue)
+      createSupportPing({
+        type: evt.type,
+        chatId,
+        userId: userId || 'anonymous',
+        amount: evt.amount || null,
+        language: evt.language || 'id',
+        message: message
+      });
+    }
+  } catch (_) {
+    // non-fatal
+  }
+
+  try {
+    // Update chat activity
+    await updateChatActivity(chatId, userId || 'anonymous');
+    
+    // Get or create chat state from database
+  let chatState = await getChatState(db, chatId);
+    let parsedState;
+    
+    // If no chat state exists, initialize it
+    if (!chatState) {
+      parsedState = {
+        context: {
+          language: 'en',
+          telegram_username: null,
+          telegram_from_id: null,
+          cid: null,
+          plan: 'EXTEND',
+          subscription_type: null,
+          preferred_currency: 'USDT',
+          transfer_address: null,
+          transfer_amount: null,
+          original_price_usdt: null,
+          converted_price_idr: null,
+          idr_rate: null,
+          transaction_date: null,
+          transaction_id: null,
+          currency: null,
+          transaction_amount: null,
+          conversationHistory: []
+        },
+        payment_state: PAYMENT_STATES.GREETING,
+        lastProcessedMessageId: null,
+        lastResponseTime: null,
+        started: Date.now(),
+        offTopicWarningCount: 0,
+        hasSentWelcome: false,
+        validation: {
+          telegram_user_identified: null,
+          cid_verified: null,
+          plan_validated: null,
+          plan_refetched: null,
+          subscription_confirmed: null,
+          currency_conversion_applied: null,
+          payment_details_ready: null,
+          transaction_extracted: null,
+          data_submitted_to_agent: null,
+          ready_for_processing: null,
+          cid_attempts: 0,
+          subscription_attempts: 0,
+          payment_attempts: 0
+        }
+      };
+      // Save initial state to database
+      await updateChatState(db, chatId, parsedState);
+    } else {
+      // Parse the existing state
+      parsedState = typeof chatState.state === 'string' ? JSON.parse(chatState.state) : chatState.state;
+    }
+    
+    // Get database instance once
+  const dbi = await getDb();
+  // Save user message to database
+  await addMessage(dbi, chatId, 'user', message);
+    
+    // Get smart response - pass the parsed state to getSmartResponse
+    const response = await getSmartResponse(chatId, message);
+    
+    // Save bot response to database
+    if (response) {
+      await addMessage(dbi, chatId, 'assistant', response);
+    }
+    // Update chat state in database with the parsed state
+    await updateChatState(dbi, chatId, parsedState);
+    
+    res.json({ 
+      success: true, 
+      response,
+      aiFeatures: {
+        offTopicDetected: detectOffTopic(message).isOffTopic,
+        cidExtracted: extractCID(message),
+        planType: extractPlanType(message),
+        currency: extractCurrencyPreference(message)
+      }
+    });
+  } catch (error) {
+    console.error('Error in send-message:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// New endpoint to get chat state information
+app.get('/chat-state/:chatId', async (req, res) => {
+  try {
+    const { chatId } = req.params;
+  const dbi = await getDb();
+  const chatState = await getChatState(dbi, chatId);
+    
+    if (!chatState) {
+      return res.status(404).json({ success: false, error: 'Chat not found' });
+    }
+    
+    // Get chat messages
+  const messages = await getChatMessages(dbi, chatId);
+    
+    // Parse the chat state from JSON string if needed
+    const parsedState = typeof chatState.state === 'string' ? JSON.parse(chatState.state) : chatState.state;
+    
+    res.json({
+      success: true,
+      chatState: {
+        payment_state: parsedState.payment_state,
+        context: parsedState.context,
+        offTopicWarningCount: parsedState.offTopicWarningCount,
+        validation: parsedState.validation,
+        messages
+      }
+    });
+  } catch (error) {
+    console.error('Error getting chat state:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// New endpoint to test smart AI features
+app.post('/test-smart-ai', async (req, res) => {
+  const { message } = req.body;
+  
+  if (!message) {
+    return res.status(400).json({ success: false, error: 'message is required' });
+  }
+  
+  try {
+    const testChatId = 'test_' + Date.now();
+    const smartResponse = await getSmartResponse(testChatId, message, `test_${Date.now()}`);
+    const offTopicDetection = detectOffTopic(message);
+    const cid = extractCID(message);
+    const planType = extractPlanType(message);
+    const currency = extractCurrencyPreference(message);
+    
+    res.json({
+      success: true,
+      originalMessage: message,
+      smartResponse: smartResponse,
+      analysis: {
+        offTopic: offTopicDetection,
+        cid: cid,
+        planType: planType,
+        currency: currency
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get all promotions (legacy routes kept for UI compatibility)
+app.get('/promotions', async (req, res) => {
+  try {
+    const promos = await getPromotions();
+    res.json({ success: true, promotions: promos });
+  } catch (error) {
+    console.error('Error getting promotions:', error);
+    res.status(500).json({ success: false, error: 'Failed to get promotions' });
+  }
+});
+
+// Add a promotion (legacy)
+app.post('/promotions', async (req, res) => {
+  try {
+  const { title, description, discount, code, timeLimit, terms, howToClaim, eligibleItems, eligibleGames, endDate } = req.body;
+    if (!title || !description || discount == null) {
+      return res.status(400).json({ success: false, error: 'Missing required fields' });
+    }
+    // Normalize eligible items/games
+    let elig = eligibleItems || eligibleGames || [];
+    if (typeof elig === 'string') {
+      elig = elig.split(',').map(s => s.trim()).filter(Boolean);
+    }
+    // Normalize howToClaim
+    let how = howToClaim;
+    if (typeof how === 'string') {
+      const arr = how.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+      how = arr.length ? arr : how.trim();
+    }
+    const newPromo = await addPromotion({
+      title,
+      description,
+      discount: Number(discount),
+      code: code || null,
+      timeLimit: timeLimit || null,
+      terms: terms || null,
+      howToClaim: how || null,
+      endDate: endDate || null,
+      eligibleItems: Array.isArray(elig) ? elig : [],
+      eligibleGames: Array.isArray(elig) ? elig : []
+    });
+    res.json({ success: true, promotion: newPromo });
+  } catch (error) {
+    console.error('Error adding promotion:', error);
+    res.status(500).json({ success: false, error: 'Failed to add promotion' });
+  }
+});
+
+// Delete a promotion (legacy)
+app.delete('/promotions/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const success = await deletePromotion(id);
+    if (!success) {
+      return res.status(404).json({ success: false, error: 'Promotion not found' });
+    }
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error deleting promotion:', error);
+    res.status(500).json({ success: false, error: 'Failed to delete promotion' });
+  }
+});
+
+// Settings endpoints
+app.get('/api/settings', auth.authMiddleware(), (req, res) => {
+  // Permission: Only owner and master can view settings
+  if (req.user.role !== 'owner' && req.user.role !== 'master') {
+    return res.status(403).json({ success: false, error: 'No permission to view settings' });
+  }
+  res.json({ success: true, settings });
+});
+
+// --- GoodCasino Bot (newtest3) local chat endpoint ---
+app.get('/api/bot/health', (req, res) => {
+  res.json({ status: 'ok' });
+});
+// Preflight for CORS
+app.options('/api/bot/chat', (req, res) => res.sendStatus(204));
+// Simple GET support for convenience/testing
+app.get('/api/bot/chat', async (req, res) => {
+  try {
+    const requiredSecret = process.env.BOT_SECRET || '';
+    if (requiredSecret) {
+      const provided = req.headers['x-bot-secret'];
+      if (!provided || provided !== requiredSecret) {
+        return res.status(401).json({ success: false, error: 'Unauthorized' });
+      }
+    }
+    const id = (req.query.chatId && String(req.query.chatId).trim()) || `web_${Date.now()}`;
+    const message = (req.query.message && String(req.query.message)) || '';
+    if (!message) return res.status(400).json({ success: false, error: 'message is required' });
+  // Persist and respond
+  try { await updateChatActivity(id, 'web'); const dbi = await getDb(); await addMessage(dbi, id, 'user', message); } catch (_) {}
+  gcGetChatState(id);
+  const reply = await gcGetResponse(id, message, `${id}_${Date.now()}`);
+  try {
+    const dbi2 = await getDb();
+    if (reply) { await addMessage(dbi2, id, 'assistant', reply); console.log('🗄️ Stored assistant reply (GET /api/bot/chat)', { chatId: id, len: reply.length }); }
+  } catch (e) { console.warn('Failed storing assistant reply (GET /api/bot/chat)', e?.message || e); }
+    return res.json({ success: true, chatId: id, reply: reply || '' });
+  } catch (e) {
+    console.error('Error in GET /api/bot/chat:', e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+app.post('/api/bot/chat', async (req, res) => {
+  try {
+    const requiredSecret = process.env.BOT_SECRET || '';
+    if (requiredSecret) {
+      const provided = req.headers['x-bot-secret'];
+      if (!provided || provided !== requiredSecret) {
+        return res.status(401).json({ success: false, error: 'Unauthorized' });
+      }
+    }
+    const { chatId, message } = req.body || {};
+    if (!message || typeof message !== 'string') {
+      return res.status(400).json({ success: false, error: 'message is required' });
+    }
+  const id = chatId && String(chatId).trim() ? String(chatId).trim() : `web_${Date.now()}`;
+  // Persist message and ensure state exists
+  try { await updateChatActivity(id, 'web'); const dbi = await getDb(); await addMessage(dbi, id, 'user', message); } catch (_) {}
+  gcGetChatState(id);
+  const reply = await gcGetResponse(id, message, `${id}_${Date.now()}`);
+  try {
+    const dbi2 = await getDb();
+    if (reply) { await addMessage(dbi2, id, 'assistant', reply); console.log('🗄️ Stored assistant reply (POST /api/bot/chat)', { chatId: id, len: reply.length }); }
+  } catch (e) { console.warn('Failed storing assistant reply (POST /api/bot/chat)', e?.message || e); }
+    return res.json({ success: true, chatId: id, reply: reply || '' });
+  } catch (e) {
+    console.error('Error in /api/bot/chat:', e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// --- LiveChat debug/admin endpoints (guarded by optional BOT_SECRET) ---
+function requireBotSecret(req, res) {
+  // Allow authenticated JWT users (owner/master/agent) to access without BOT_SECRET
+  try {
+    const hdr = req.headers['authorization'] || '';
+    const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
+    if (token) {
+      const jwt = require('jsonwebtoken');
+      const payload = jwt.verify(token, process.env.JWT_SECRET || 'dev_secret_change_me');
+      if (payload && payload.sub) {
+        return true;
+      }
+    }
+  } catch (_) {
+    // fall through to BOT_SECRET check
+  }
+  const required = process.env.BOT_SECRET || '';
+  if (!required) return true;
+  const provided = req.headers['x-bot-secret'];
+  if (!provided || provided !== required) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return false;
+  }
+  return true;
+}
+
+// Simple cache for chat list (5 second TTL to reduce API load)
+let chatListCache = { data: null, timestamp: 0, ttl: 5000 };
+
+// List chats with optional ?status=active,queued,pending (defaults to active,queued,pending)
+app.get('/api/livechat/chats', async (req, res) => {
+  if (!requireBotSecret(req, res)) return;
+  const statuses = (req.query.status || 'active,queued,pending')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  const includeUnmapped = String(req.query.includeUnmapped || '').toLowerCase() === 'true';
+  const requestedGroupId = req.query.groupId ? Number(req.query.groupId) : null;
+  const body = { filters: { status: statuses }, limit: 50 };
+  
+  // Use cache if available and fresh (reduces LiveChat API load)
+  const now = Date.now();
+  let resp;
+  if (chatListCache.data && (now - chatListCache.timestamp) < chatListCache.ttl) {
+    console.log('📦 Using cached chat list');
+    resp = chatListCache.data;
+  } else {
+    resp = await livechatPost('/agent/action/list_chats', body, {});
+    if (!resp.ok) return res.status(resp.status).json({ success: false, error: resp.error, details: resp.raw });
+    // Cache the response
+    chatListCache = { data: resp, timestamp: now, ttl: 5000 };
+  }
+  
+  let chats = resp.data?.chats_summary || resp.data?.chats || resp.data?.data?.chats || resp.data?.results || resp.data;
+  // Build mapping for all chats once
+  const idsAll = Array.isArray(chats) ? chats.map(c => c.id || c.chat?.id).filter(Boolean) : [];
+  const { getChatGroupMap } = require('./db-utils.js');
+  let chatGroupMap = {};
+  try { chatGroupMap = await getChatGroupMap(idsAll); } catch(_) { chatGroupMap = {}; }
+  // Optional: filter by agent groups if JWT is supplied (agents only)
+  try {
+    const hdr = req.headers['authorization'] || '';
+    const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
+    if (token) {
+      const jwt = require('jsonwebtoken');
+      const payload = jwt.verify(token, process.env.JWT_SECRET || 'dev_secret_change_me');
+      const user = await auth.findUserById(payload.sub);
+      if (user && (user.role === 'agent' || user.role === 'master')) {
+        const groups = user.role === 'agent' ? await auth.getAgentGroups(user.id) : await auth.getMasterGroups(user.id);
+        const allowedGroupIds = new Set(groups.map(g => g.id));
+        // If a specific groupId is requested, further restrict to that group
+        if (requestedGroupId) {
+          if (!allowedGroupIds.has(requestedGroupId) && user.role !== 'owner') {
+            // deny if not allowed
+            return res.status(403).json({ success: false, error: 'Forbidden (group not assigned)' });
+          }
+        }
+        // Filter by allowed groups and group selection; exclude unmapped by default
+        chats = (Array.isArray(chats) ? chats : []).filter(c => {
+          const id = c.id || c.chat?.id;
+          const gid = chatGroupMap[id];
+          if (requestedGroupId && Number(gid) !== requestedGroupId) return false;
+          if (!gid && !includeUnmapped) return false;
+          return allowedGroupIds.has(Number(gid));
+        });
+      }
+    }
+  } catch (_) {}
+  // For owner/anonymous callers: apply generic filter — exclude unmapped unless explicitly included; honor groupId
+  if (!Array.isArray(chats)) chats = [];
+  chats = chats.filter(c => {
+    const id = c.id || c.chat?.id;
+    const gid = chatGroupMap[id];
+    if (requestedGroupId) return Number(gid) === requestedGroupId;
+    return includeUnmapped ? true : !!gid;
+  });
+  res.json({ success: true, count: Array.isArray(chats) ? chats.length : 0, chats });
+});
+
+// Group-scoped RTP endpoints
+app.get('/api/groups/:id/rtp', auth.authMiddleware(), async (req, res) => {
+  try {
+    const gid = Number(req.params.id);
+    // Scope check for master/agent
+    if (req.user.role === 'master') {
+      const allowed = await auth.getMasterGroups(req.user.id);
+      const ids = new Set((allowed||[]).map(g=>g.id)); if (!ids.has(gid)) return res.status(403).json({ success:false, error:'Forbidden' });
+    } else if (req.user.role === 'agent') {
+      const allowed = await auth.getAgentGroups(req.user.id);
+      const ids = new Set((allowed||[]).map(g=>g.id)); if (!ids.has(gid)) return res.status(403).json({ success:false, error:'Forbidden' });
+    }
+    const cfg = await getGroupConfig(gid);
+    res.json({ success:true, rtpLink: cfg?.rtpLink || null });
+  } catch (e) { res.status(500).json({ success:false, error:e.message }); }
+});
+app.put('/api/groups/:id/rtp', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (!(req.user.role === 'owner' || req.user.role === 'master')) {
+      return res.status(403).json({ success:false, error:'Forbidden' });
+    }
+    const gid = Number(req.params.id);
+    const { rtpLink: link } = req.body || {};
+    if (!link || typeof link !== 'string' || !/^https?:\/\//i.test(link.trim())) {
+      return res.status(400).json({ success:false, error:'Valid rtpLink (http/https) required' });
+    }
+    // Masters can only update their groups
+    if (req.user.role === 'master') {
+      const allowed = await auth.getMasterGroups(req.user.id);
+      const ids = new Set((allowed||[]).map(g=>g.id)); if (!ids.has(gid)) return res.status(403).json({ success:false, error:'Forbidden' });
+    }
+    const existing = await getGroupConfig(gid) || { brandName: 'GoodCasino', aiSettings: {} };
+    const cfg = await upsertGroupConfig(gid, { brandName: existing.brandName, aiSettings: existing.aiSettings || {}, rtpLink: link.trim() });
+    res.json({ success:true, rtpLink: cfg.rtpLink });
+  } catch (e) { res.status(500).json({ success:false, error:e.message }); }
+});
+
+// Get single chat status
+app.get('/api/livechat/chat/:chatId', async (req, res) => {
+  if (!requireBotSecret(req, res)) return;
+  const { chatId } = req.params;
+  const resp = await livechatPost('/agent/action/get_chat', { chat_id: chatId }, {});
+  if (!resp.ok) return res.status(resp.status).json({ success: false, error: resp.error, details: resp.raw });
+  res.json({ success: true, chat: resp.data?.chat || resp.data?.data?.chat || resp.data });
+});
+
+// Accept a queued/pending chat
+app.post('/api/livechat/accept/:chatId', async (req, res) => {
+  if (!requireBotSecret(req, res)) return;
+  const { chatId } = req.params;
+  const resp = await livechatPost('/agent/action/accept_chat', { chat_id: chatId }, {});
+  if (!resp.ok) return res.status(resp.status).json({ success: false, error: resp.error, details: resp.raw });
+  res.json({ success: true, result: resp.data });
+});
+
+// Join a chat as participant
+app.post('/api/livechat/join/:chatId', async (req, res) => {
+  if (!requireBotSecret(req, res)) return;
+  const { chatId } = req.params;
+  const resp = await livechatPost('/agent/action/join_chat', { chat_id: chatId }, {});
+  if (!resp.ok) return res.status(resp.status).json({ success: false, error: resp.error, details: resp.raw });
+  res.json({ success: true, result: resp.data });
+});
+
+// Send a message to a chat
+app.post('/api/livechat/send/:chatId', async (req, res) => {
+  if (!requireBotSecret(req, res)) return;
+  const { chatId } = req.params;
+  const { text } = req.body || {};
+  if (!text || typeof text !== 'string') {
+    return res.status(400).json({ success: false, error: 'text is required' });
+  }
+  
+  // CHANGED: Allow human messages even when Global Auto AI is enabled
+  // This enables collaborative mode where both AI and agents can respond together
+  // Removed the blocking check to allow agents to work alongside AI
+  
+  const resp = await livechatPost('/agent/action/send_event', {
+    chat_id: chatId,
+    event: { type: 'message', text, recipients: 'all' }
+  }, {});
+  if (!resp.ok) return res.status(resp.status).json({ success: false, error: resp.error, details: resp.raw });
+  // Persist and log the outgoing message for visibility
+  try { await updateChatActivity(chatId, 'agent'); const dbi = await getDb(); await addMessage(dbi, chatId, 'assistant', text); } catch (_) {}
+  console.log(`Agent reply sent to ${chatId}: ${text}`);
+  // If an authenticated agent sent this, log
+  try { if (req.headers.authorization) {
+    const mid = await (async () => { try { const tok = req.headers.authorization.split(' ')[1]; const jwt = require('jsonwebtoken'); const payload = jwt.verify(tok, process.env.JWT_SECRET || 'dev_secret_change_me'); return payload.sub; } catch (_) { return null; } })();
+    if (mid) await auth.logAgentAction(mid, 'chat_reply', { text }, chatId);
+  } } catch (_) {}
+  res.json({ success: true, result: resp.data });
+});
+
+// Get chat threads/events
+app.get('/api/livechat/threads/:chatId', async (req, res) => {
+  if (!requireBotSecret(req, res)) return;
+  const { chatId } = req.params;
+  const resp = await livechatPost('/agent/action/list_threads', { chat_id: chatId }, {});
+  if (!resp.ok) return res.status(resp.status).json({ success: false, error: resp.error, details: resp.raw });
+  res.json({ success: true, threads: resp.data?.threads || resp.data?.data?.threads || [] });
+});
+
+// --- SSE LiveChat Integration ---
+// SSE endpoint for AI to connect to LiveChat events (alternative to webhooks)
+app.get('/api/livechat/sse', (req, res) => {
+  if (!liveChatSSE) {
+    return res.status(404).json({ error: 'SSE not enabled. Set ENABLE_LIVECHAT_SSE=true' });
+  }
+
+  console.log('🔌 SSE: New LiveChat AI connection');
+  
+  // Set SSE headers
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Cache-Control'
+  });
+
+  // Add to SSE clients in manager
+  const clientId = Date.now() + Math.random();
+  const client = { id: clientId, res, lastPing: Date.now() };
+  
+  if (liveChatSSE.sseClients) {
+    liveChatSSE.sseClients.add(client);
+  }
+  
+  // Send connection confirmation
+  const sseData = `event: connected\ndata: ${JSON.stringify({
+    message: 'Connected to LiveChat SSE',
+    clientId,
+    timestamp: new Date().toISOString()
+  })}\n\n`;
+  res.write(sseData);
+
+  // Handle disconnect
+  req.on('close', () => {
+    if (liveChatSSE.sseClients) {
+      liveChatSSE.sseClients.delete(client);
+    }
+    console.log(`🔌 SSE: LiveChat AI disconnected (${clientId})`);
+  });
+});
+
+// SSE status endpoint
+app.get('/api/livechat/sse/status', (req, res) => {
+  if (!liveChatSSE) {
+    return res.json({
+      success: true,
+      sseEnabled: false,
+      message: 'SSE not enabled. Set ENABLE_LIVECHAT_SSE=true'
+    });
+  }
+
+  res.json({
+    success: true,
+    sseEnabled: true,
+    connections: liveChatSSE.sseClients?.size || 0,
+    activeChats: liveChatSSE.activeChatPolling?.size || 0,
+    chats: Array.from(liveChatSSE.activeChatPolling?.keys() || [])
+  });
+});
+
+// --- Chat -> Group mapping endpoints ---
+// Set mapping (owner or master)
+app.put('/api/chat-groups', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (!(req.user.role === 'owner' || req.user.role === 'master')) {
+      return res.status(403).json({ success: false, error: 'Forbidden' });
+    }
+    const { chatId, groupId } = req.body || {};
+    if (!chatId || !groupId) {
+      return res.status(400).json({ success: false, error: 'chatId and groupId are required' });
+    }
+    const db = await getDb();
+    const g = db.prepare('SELECT id FROM groups WHERE id = ?').get(Number(groupId));
+    if (!g) return res.status(404).json({ success: false, error: 'Group not found' });
+    if (req.user.role === 'master') {
+      const allowed = await auth.getMasterGroups(req.user.id);
+      const ids = new Set((allowed || []).map(gr => gr.id));
+      if (!ids.has(Number(groupId))) return res.status(403).json({ success: false, error: 'Forbidden (group not assigned to this master)' });
+    }
+    const { setChatGroup } = require('./db-utils.js');
+    await setChatGroup(String(chatId), Number(groupId));
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Get mapping for specific chat ids (comma-separated query ?ids=a,b,c)
+app.get('/api/chat-groups', auth.authMiddleware(), async (req, res) => {
+  try {
+    const idsParam = String(req.query.ids || '').trim();
+    const ids = idsParam ? idsParam.split(',').map(s => s.trim()).filter(Boolean) : [];
+    const { getChatGroupMap } = require('./db-utils.js');
+    let map = await getChatGroupMap(ids);
+    // Scope: agents see only their groups; masters see only their groups as well
+    if (req.user.role === 'agent' || req.user.role === 'master') {
+      const allowed = req.user.role === 'agent' ? await auth.getAgentGroups(req.user.id) : await auth.getMasterGroups(req.user.id);
+      const allowedIds = new Set((allowed || []).map(g => g.id));
+      map = Object.fromEntries(Object.entries(map).filter(([cid, gid]) => allowedIds.has(Number(gid))));
+    }
+    res.json({ success: true, map });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Owner: bulk reset passwords to a temporary value (dangerous). Requires confirm=true.
+app.post('/api/owner/reset-all-passwords', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const { tempPassword, confirm } = req.body || {};
+    if (!confirm) return res.status(400).json({ success: false, error: 'confirm=true required' });
+    if (!tempPassword || String(tempPassword).length < 8) return res.status(400).json({ success: false, error: 'tempPassword min 8 chars required' });
+    const db = await getDb();
+    const bcrypt = require('bcryptjs');
+    const hash = bcrypt.hashSync(String(tempPassword), 10);
+    const info = db.prepare("UPDATE users SET password_hash = ? WHERE role IN ('agent','master')").run(hash);
+    res.json({ success: true, updated: info.changes });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+app.post('/api/settings', auth.authMiddleware(), async (req, res) => {
+  try {
+    // Permission: Only owner and master can edit settings
+    if (req.user.role !== 'owner' && req.user.role !== 'master') {
+      return res.status(403).json({ success: false, error: 'No permission to edit settings' });
+    }
+    
+    const { 
+      brandName, 
+      welcomeMessage, 
+      waitMessage, 
+      endMessage,
+      minDeposit,
+      maxDeposit,
+      minWithdrawal,
+      maxWithdrawal
+    } = req.body || {};
+    
+    if (!brandName || !welcomeMessage || !waitMessage || !endMessage) {
+      return res.status(400).json({ success: false, error: 'Basic fields (brandName, welcomeMessage, waitMessage, endMessage) are required' });
+    }
+    
+    // Update settings with new deposit/withdrawal limits
+    settings = { 
+      brandName, 
+      welcomeMessage, 
+      waitMessage, 
+      endMessage,
+      minDeposit: minDeposit ? parseInt(minDeposit) : null,
+      maxDeposit: maxDeposit ? parseInt(maxDeposit) : null,
+      minWithdrawal: minWithdrawal ? parseInt(minWithdrawal) : null,
+      maxWithdrawal: maxWithdrawal ? parseInt(maxWithdrawal) : null
+    };
+    
+    await saveSettingsToFile();
+    
+    try {
+      const { setGlobalBrandName, reloadSettings } = require('./newtest3.js');
+      if (typeof setGlobalBrandName === 'function') {
+        setGlobalBrandName(String(brandName));
+      }
+      // Reload all settings in newtest3.js to clear require cache
+      if (typeof reloadSettings === 'function') {
+        reloadSettings();
+      }
+    } catch (_) {}
+    
+    console.log('💰 Settings updated with deposit/withdrawal limits:', {
+      minDeposit: settings.minDeposit,
+      maxDeposit: settings.maxDeposit,
+      minWithdrawal: settings.minWithdrawal,
+      maxWithdrawal: settings.maxWithdrawal
+    });
+    
+    res.json({ success: true, settings });
+  } catch (e) {
+    console.error('Failed to save settings:', e?.message || e);
+    res.status(500).json({ success: false, error: 'Failed to save settings' });
+  }
+});
+
+// --- Support Ping Endpoints ---
+// Create a new support ping (e.g., when a user says they've deposited)
+app.post('/support-ping', (req, res) => {
+  try {
+    const { type = 'deposit_check', chatId, userId, amount = null, language = 'id', message } = req.body || {};
+    if (!chatId || !userId) {
+      return res.status(400).json({ success: false, error: 'chatId and userId are required' });
+    }
+    // For certain types, amount is recommended but not strictly required
+    const ping = createSupportPing({ type, chatId, userId, amount, language, message: message || '' });
+    return res.json({ success: true, ping });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Get unread support pings; optional query markRead=true to mark them as read
+app.get('/support-pings', (req, res) => {
+  try {
+    const { markRead, scope, all } = req.query;
+    // Default behavior kept for backward compatibility: only unread
+    let list;
+    if ((scope && String(scope).toLowerCase() === 'unresolved') || (all && String(all).toLowerCase() === 'true')) {
+      // Include any ping that hasn't been resolved yet (read or unread)
+      list = supportPings.filter(p => !p.resolved).sort((a, b) => a.timestamp - b.timestamp);
+    } else {
+      // Unread only
+      list = supportPings.filter(p => !p.read).sort((a, b) => a.timestamp - b.timestamp);
+    }
+    if (markRead === 'true') {
+      list.forEach(p => { p.read = true; });
+    }
+    return res.json({ success: true, pings: list });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// --- Support Quick Replies ---
+// Predefined quick replies by support type
+const SUPPORT_QUICK_REPLIES = {
+  deposit_check: [
+    { key: 'deposit_processed', label: 'Deposit processed', reply: 'Deposit sudah kami proses, silakan cek saldo Anda ya bosku.' },
+    { key: 'deposit_not_received', label: 'Deposit not received yet', reply: 'Maaf bosku, deposit belum kami terima. Mohon tunggu beberapa menit atau kirim bukti transfer.' }
+  ],
+  withdraw_check: [
+    { key: 'withdraw_processed', label: 'Withdraw processed', reply: 'Penarikan sudah diproses. Silakan cek rekening Anda dalam beberapa menit.' },
+    { key: 'withdraw_pending', label: 'Withdraw pending', reply: 'Penarikan masih dalam antrian. Mohon ditunggu ya bosku.' }
+  ],
+  password_reset: [
+    { key: 'password_reset_steps', label: 'Send reset steps', reply: 'Untuk reset password, silakan gunakan fitur “Lupa Password” di aplikasi atau hubungi kami dengan data verifikasi.' }
+  ],
+  turnover: [
+    { key: 'turnover_info', label: 'Explain turnover', reply: 'Turnover adalah total nilai taruhan. Kami bisa cekkan untuk Anda jika berikan ID akun.' }
+  ]
+};
+
+// Get quick replies for a type
+app.get('/support-quick-replies', auth.authMiddleware(), (req, res) => {
+  try {
+    const type = String(req.query.type || '').trim();
+    const items = type ? (SUPPORT_QUICK_REPLIES[type] || []) : SUPPORT_QUICK_REPLIES;
+    res.json({ success: true, replies: items, type: type || null });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Send a quick reply to a chat (agent/master/owner)
+app.post('/support-quick-replies/send', auth.authMiddleware(), async (req, res) => {
+  try {
+    const { chatId, type, key } = req.body || {};
+    if (!chatId || !type || !key) return res.status(400).json({ success: false, error: 'chatId, type, key required' });
+    const items = SUPPORT_QUICK_REPLIES[type] || [];
+    const item = items.find(r => r.key === key);
+    if (!item) return res.status(404).json({ success: false, error: 'Quick reply not found' });
+    const groupMapping = await getChatGroup(String(chatId));
+    const internalGroupId = groupMapping ? (Number(groupMapping.group_id ?? groupMapping.groupId ?? groupMapping) || null) : null;
+    const lcGroupId = internalGroupId ? await getGroupLivechatGroupId(internalGroupId) : null;
+    try {
+      await sendReply(
+        {
+          chat_id: String(chatId),
+          chat: { id: String(chatId), group_id: lcGroupId }
+        },
+        item.reply,
+        {
+          internalGroupId,
+          groupId: lcGroupId
+        }
+      );
+    } catch (e) {
+      return res.status(502).json({ success: false, error: 'Failed to send via LiveChat', details: e?.response?.data || e.message });
+    }
+    try { const dbi = await getDb(); await addMessage(dbi, String(chatId), 'assistant', item.reply); } catch (_) {}
+    try { await auth.logAgentAction(req.user.id, 'support_quick_reply', { type, key }, String(chatId)); } catch (_) {}
+    // Optionally mark related ping as read/resolved client-side
+    res.json({ success: true, sent: true, chatId, reply: item.reply });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Mark a support ping as resolved with a selected action (optional helper)
+app.post('/support-pings/:id/resolve', auth.authMiddleware(), (req, res) => {
+  try {
+    const id = String(req.params.id);
+    const { resolution = null } = req.body || {};
+    const p = supportPings.find(x => x.id === id);
+    if (!p) return res.status(404).json({ success: false, error: 'Ping not found' });
+    p.read = true;
+    p.resolved = true;
+    p.resolution = resolution;
+    res.json({ success: true, ping: p });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Get LiveChat metadata for a specific chat
+app.get('/api/chat/:chatId/livechat-metadata', auth.authMiddleware(), async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { getChatLivechatMetadata } = require('./db-utils.js');
+    const metadata = await getChatLivechatMetadata(chatId);
+    
+    if (!metadata) {
+      return res.json({ 
+        success: true, 
+        metadata: null,
+        message: 'No LiveChat metadata found (chat may have come in before metadata tracking was enabled)'
+      });
+    }
+    
+    res.json({ success: true, metadata });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Get AI capabilities
+app.get('/ai-capabilities', (req, res) => {
+  res.json({
+    success: true,
+    capabilities: {
+      paymentProcessing: true,
+      cidExtraction: true,
+      planTypeDetection: true,
+      currencyConversion: true,
+      offTopicDetection: true,
+      bilingualSupport: true,
+      stateMachine: true,
+      smartResponseGeneration: true,
+      paymentStates: Object.values(PAYMENT_STATES),
+      supportedLanguages: ['en', 'id'],
+      supportedCurrencies: ['USDT', 'IDR'],
+      supportedPlans: ['EXTEND', 'UPGRADE', 'DOWNGRADE']
+    }
+  });
+});
+
+// Debug endpoint: Show chat-to-group mappings
+app.get('/api/debug/chat-mapping', auth.authMiddleware('owner'), async (req, res) => {
+  try {
+    const db = await getDb();
+    
+    // Get all mapped chats with group details
+    const mappedChats = db.prepare(`
+      SELECT 
+        cg.chat_id,
+        cg.group_id,
+        g.name as group_name,
+        gc.livechat_group_id,
+        gc.brand_name,
+        gc.livechat_license
+      FROM chat_groups cg
+      LEFT JOIN groups g ON g.id = cg.group_id
+      LEFT JOIN groups_config gc ON gc.group_id = cg.group_id
+      ORDER BY cg.chat_id DESC
+      LIMIT 100
+    `).all();
+    
+    // Get all group configurations
+    const groupConfigs = db.prepare(`
+      SELECT 
+        g.id,
+        g.name,
+        gc.brand_name,
+        gc.livechat_group_id,
+        gc.livechat_license,
+        gc.livechat_client_id
+      FROM groups g
+      LEFT JOIN groups_config gc ON gc.group_id = g.id
+      ORDER BY g.id
+    `).all();
+    
+    // Count chats per group
+    const chatCounts = db.prepare(`
+      SELECT group_id, COUNT(*) as count
+      FROM chat_groups
+      GROUP BY group_id
+    `).all();
+    
+    const countMap = {};
+    chatCounts.forEach(c => {
+      countMap[c.group_id] = c.count;
+    });
+    
+    res.json({
+      success: true,
+      timestamp: new Date().toISOString(),
+      summary: {
+        totalMappedChats: mappedChats.length,
+        totalGroups: groupConfigs.length,
+        groupsWithChats: chatCounts.length
+      },
+      mappedChats: mappedChats.map(c => ({
+        chatId: c.chat_id,
+        internalGroupId: c.group_id,
+        groupName: c.group_name || 'Unknown',
+        brandName: c.brand_name || 'N/A',
+        livechatGroupId: c.livechat_group_id || '⚠️ NOT CONFIGURED',
+        livechatLicense: c.livechat_license || 'N/A'
+      })),
+      groupConfigs: groupConfigs.map(g => ({
+        id: g.id,
+        name: g.name,
+        brandName: g.brand_name || 'N/A',
+        livechatGroupId: g.livechat_group_id || '⚠️ NOT SET - Chats will NOT be mapped!',
+        livechatLicense: g.livechat_license || 'Not configured',
+        livechatClientId: g.livechat_client_id || 'Not configured',
+        mappedChatsCount: countMap[g.id] || 0,
+        status: g.livechat_group_id ? '✅ Ready' : '⚠️ Missing LiveChat Group ID'
+      }))
+    });
+  } catch (e) {
+    console.error('Error in /api/debug/chat-mapping:', e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Real-time performance monitoring endpoint
+app.get('/api/performance/metrics', auth.authMiddleware(), (req, res) => {
+  try {
+    const metrics = global.__performanceMetrics || [];
+    const recentMetrics = metrics.slice(-50); // Last 50 responses
+    
+    // Calculate performance statistics
+    const stats = {
+      totalResponses: metrics.length,
+      recentResponses: recentMetrics.length,
+      averageResponseTime: recentMetrics.length > 0 ? 
+        Math.round(recentMetrics.reduce((sum, m) => sum + m.totalTime, 0) / recentMetrics.length) : 0,
+      averageAiTime: recentMetrics.length > 0 ? 
+        Math.round(recentMetrics.reduce((sum, m) => sum + m.aiTime, 0) / recentMetrics.length) : 0,
+      fastResponses: recentMetrics.filter(m => m.totalTime < 1000).length,
+      slowResponses: recentMetrics.filter(m => m.totalTime > 5000).length,
+      aiSuccessRate: recentMetrics.length > 0 ? 
+        Math.round((recentMetrics.filter(m => m.hasAiResponse).length / recentMetrics.length) * 100) : 0,
+      fallbackRate: recentMetrics.length > 0 ? 
+        Math.round((recentMetrics.filter(m => m.fallbackUsed).length / recentMetrics.length) * 100) : 0
+    };
+    
+    res.json({
+      success: true,
+      timestamp: new Date().toISOString(),
+      statistics: stats,
+      recentMetrics: recentMetrics,
+      serverUptime: Math.round(process.uptime())
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Reset performance metrics (for testing)
+app.post('/api/performance/reset', auth.authMiddleware(), (req, res) => {
+  try {
+    if (req.user.role !== 'owner') {
+      return res.status(403).json({ success: false, error: 'Only owners can reset metrics' });
+    }
+    global.__performanceMetrics = [];
+    res.json({ success: true, message: 'Performance metrics reset' });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Agent Chat Manager status and control endpoints
+app.get('/api/agent-chat/status', auth.authMiddleware(), (req, res) => {
+  try {
+    const status = agentChatManager.getStatus();
+    res.json({
+      success: true,
+      agentChatManager: status,
+      timestamp: new Date().toISOString()
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Force bubble check (manual trigger)
+app.post('/api/agent-chat/check-bubbles', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (req.user.role !== 'owner' && req.user.role !== 'master') {
+      return res.status(403).json({ success: false, error: 'Insufficient permissions' });
+    }
+    
+    console.log('🔍 Manual bubble check triggered by user:', req.user.email);
+    const chats = await agentChatManager.getActiveChats();
+    
+    res.json({
+      success: true,
+      message: 'Bubble check completed',
+      activeBubbles: chats.length,
+      chats: chats.map(chat => ({
+        id: chat.id,
+        status: chat.status,
+        hasUnread: chat.has_unread_messages
+      }))
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Test webhook processing (for development and testing)
+app.post('/api/webhook/test', auth.authMiddleware(), async (req, res) => {
+  try {
+    if (req.user.role !== 'owner' && req.user.role !== 'master') {
+      return res.status(403).json({ success: false, error: 'Insufficient permissions' });
+    }
+    
+    const { chatId, message, skipLiveChat = true } = req.body;
+    
+    if (!chatId || !message) {
+      return res.status(400).json({ success: false, error: 'chatId and message are required' });
+    }
+    
+    console.log('\n🧪 ===== WEBHOOK TEST STARTED =====');
+    console.log(`📱 Test Chat ID: ${chatId}`);
+    console.log(`📝 Test Message: "${message}"`);
+    console.log(`⏰ Started: ${new Date().toLocaleString()}`);
+    
+    const startTime = Date.now();
+    
+    // Test the AI response system
+    let reply = null;
+    try {
+      gcGetChatState(chatId);
+      reply = await gcGetResponse(chatId, message, `${chatId}_test_${Date.now()}`);
+    } catch (e) {
+      console.error('❌ Test AI response failed:', e.message);
+    }
+    
+    const processingTime = Date.now() - startTime;
+    
+    const result = {
+      success: true,
+      testResults: {
+        chatId,
+        inputMessage: message,
+        aiResponse: reply,
+        processingTimeMs: processingTime,
+        timestamp: new Date().toISOString(),
+        performanceRating: processingTime < 1000 ? 'Fast' : processingTime < 3000 ? 'Good' : processingTime < 5000 ? 'Slow' : 'Very Slow'
+      }
+    };
+    
+    console.log(`✅ Test completed in ${processingTime}ms`);
+    console.log(`📝 AI Response: "${reply?.slice(0, 100)}${reply?.length > 100 ? '...' : ''}"`);
+    console.log('🧪 ===========================\n');
+    
+    // Optionally send to LiveChat if not skipped
+    if (!skipLiveChat && reply) {
+      const groupMapping = await getChatGroup(chatId);
+      const internalGroupId = groupMapping ? (Number(groupMapping.group_id ?? groupMapping.groupId ?? groupMapping) || null) : null;
+      const lcGroupId = internalGroupId ? await getGroupLivechatGroupId(internalGroupId) : null;
+      try {
+        await sendReply(
+          {
+            chat_id: chatId,
+            chat: { id: chatId, group_id: lcGroupId }
+          },
+          reply,
+          {
+            internalGroupId,
+            groupId: lcGroupId
+          }
+        );
+        result.testResults.sentToLiveChat = true;
+        console.log('📤 Test response sent to LiveChat');
+      } catch (e) {
+        result.testResults.liveChatError = e.message;
+        console.warn('❌ Failed to send test response to LiveChat:', e.message);
+      }
+    }
+    
+    res.json(result);
+    
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Add request logging middleware
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+  next();
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Server Error:', err);
+  res.status(500).json({ error: 'Internal Server Error' });
+});
+
+// 404 handler for API routes to return JSON consistently
+app.use('/api', (req, res) => {
+  res.status(404).json({ success: false, error: `Not found: ${req.method} ${req.originalUrl}` });
+});
+
+// Helper function to get local IP address
+function getLocalIpAddress() {
+  const interfaces = require('os').networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name]) {
+      const { address, family, internal } = iface;
+      if (family === 'IPv4' && !internal) {
+        return address;
+      }
+    }
+  }
+  return 'localhost';
+}
+
+// Track if we're already shutting down
+let isShuttingDown = false;
+
+// Handle process termination
+const gracefulShutdown = () => {
+  // Prevent multiple shutdown attempts
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  
+  console.log('\n👋 Shutting down server...');
+  
+  // Close server instance first
+  if (serverInstance) {
+    console.log('🛑 Closing server...');
+    serverInstance.close((err) => {
+      if (err) {
+        console.error('Error closing server:', err);
+      } else {
+        console.log('✅ Server has been stopped');
+      }
+      
+      // Close database connection after server is closed
+      if (db) {
+        console.log('🔒 Closing database connection...');
+        try {
+          // better-sqlite3 uses synchronous close()
+          db.close();
+          console.log('✅ Database connection closed');
+          process.exit(0);
+        } catch (dbError) {
+          console.error('Error during database close:', dbError);
+          process.exit(0); // Still exit even if DB close fails
+        }
+      } else {
+        process.exit(0);
+      }
+    });
+    
+    // Force close after 5 seconds if server doesn't close gracefully
+    setTimeout(() => {
+      console.warn('⚠️ Forcing server shutdown...');
+      process.exit(0); // Use exit code 0 to prevent error reporting
+    }, 5000);
+  } else {
+    // No server instance, just close DB if it exists
+    if (db) {
+      console.log('🔒 Closing database connection...');
+      try {
+        db.close((err) => {
+          if (err) {
+            console.error('Error closing database:', err);
+          } else {
+            console.log('✅ Database connection closed');
+          }
+          process.exit(0);
+        });
+      } catch (dbError) {
+        console.error('Error during database close:', dbError);
+        process.exit(0);
+      }
+    } else {
+      process.exit(0);
+    }
+  }
+};
+
+process.on('SIGINT', gracefulShutdown);
+process.on('SIGTERM', gracefulShutdown);

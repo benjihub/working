@@ -1,6 +1,6 @@
 // registerWebhook.js
 // Robust CLI to register LiveChat webhook (tries Bearer/Basic and v3.6/v3.5/v3.3)
-require('dotenv').config();
+require('dotenv').config({ override: true });
 const axios = require('axios');
 const { getHeaderVariants } = require('./livechatAuth');
 
@@ -8,71 +8,98 @@ const clientId = process.env.LIVECHAT_CLIENT_ID;
 const headerVariants = getHeaderVariants();
 const webhookUrl = process.env.LIVECHAT_WEBHOOK_URL;
 const secret = process.env.LIVECHAT_WEBHOOK_SECRET;
-const description = process.env.LIVECHAT_WEBHOOK_DESCRIPTION || 'Webhook for incoming chat events';
+const description = process.env.LIVECHAT_WEBHOOK_DESCRIPTION || 'GoodCasino LiveChat webhook';
 const type = process.env.LIVECHAT_WEBHOOK_TYPE || 'license';
+const actionsEnv = process.env.LIVECHAT_WEBHOOK_ACTIONS || 'incoming_event,customer_message,chat_started,thread_started';
+const actions = actionsEnv.split(',').map(a => a.trim()).filter(Boolean);
 
 if (!clientId || !webhookUrl || !secret || !headerVariants || headerVariants.length === 0) {
   console.error('Missing env: LIVECHAT_CLIENT_ID, LIVECHAT_WEBHOOK_URL, LIVECHAT_WEBHOOK_SECRET, and LiveChat credentials');
   process.exit(1);
 }
 
-async function register() {
-  const attempts = [];
-  for (const ver of ['v3.6', 'v3.5']) {
-    attempts.push({
-      label: `${ver}`,
-      url: `https://api.livechatinc.com/${ver}/configuration/action/register_webhook`,
-      // Top-level payload per API docs; single action per registration
-      body: {
-        url: webhookUrl,
-        description: 'GoodCasino bot incoming customer messages',
-        action: 'incoming_event',
-        secret_key: secret,
-        owner_client_id: clientId,
-        type,
-        filters: {
-          author_type: 'customer'
-        }
-      }
-    });
+if (actions.length === 0) {
+  console.error('No webhook actions provided. Set LIVECHAT_WEBHOOK_ACTIONS or leave default.');
+  process.exit(1);
+}
+
+async function attemptRegistration({ url, body, label }) {
+  let lastErr = null;
+  for (const variant of headerVariants) {
+    const variantName = Object.values(variant)[0]?.toString().startsWith('Basic') ? 'Basic' : 'Bearer';
+    try {
+      const { data, status } = await axios.post(url, body, {
+        headers: { ...variant, 'Content-Type': 'application/json', Accept: 'application/json' },
+        timeout: 20000
+      });
+      console.log(`✅ Registered ${body.action} via ${label} using ${variantName} (status ${status})`);
+      return { ok: true, data };
+    } catch (err) {
+      lastErr = err;
+      const status = err.response?.status;
+      const msg = err.response?.data?.error?.message || err.response?.data || err.message;
+      console.warn(`⚠️ ${body.action} attempt ${label} with ${variantName} failed:`, status, msg);
+      // Continue trying other variants/versions
+    }
   }
-  attempts.push({
-    label: 'v3.3 (flat)',
-    url: 'https://api.livechatinc.com/v3.3/configuration/action/register_webhook',
-    body: {
+  return { ok: false, error: lastErr };
+}
+
+async function register() {
+  const failures = [];
+  for (const action of actions) {
+    let registered = false;
+    const payloadBase = {
       url: webhookUrl,
-      description: 'GoodCasino bot incoming messages (v3.3 fallback)',
-      action: 'incoming_event',
+      description,
+      action,
       secret_key: secret,
       owner_client_id: clientId,
       type
-    }
-  });
+    };
+    const payloadWithFilters = /incoming_event|customer_message/.test(action)
+      ? { ...payloadBase, filters: { author_type: 'customer' } }
+      : payloadBase;
 
-  let lastErr = null;
-  for (const attempt of attempts) {
-    for (const variant of headerVariants) {
-      try {
-        const { data, status } = await axios.post(
-          attempt.url,
-          attempt.body,
-          { headers: { ...variant, 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 20000 }
-        );
-        const variantName = Object.values(variant)[0]?.toString().startsWith('Basic') ? 'Basic' : 'Bearer';
-        console.log(`Webhook registered via ${attempt.label} using ${variantName} (status ${status})`);
-        console.log(data);
-        return;
-      } catch (err) {
-        const status = err.response?.status;
-        const msg = err.response?.data?.error?.message || err.response?.data || err.message;
-        const variantName = Object.values(variant)[0]?.toString().startsWith('Basic') ? 'Basic' : 'Bearer';
-        console.warn(`Attempt ${attempt.label} with ${variantName} failed:`, status, msg);
-        lastErr = err;
+    const attempts = [
+      {
+        label: 'v3.6',
+        url: 'https://api.livechatinc.com/v3.6/configuration/action/register_webhook',
+        body: payloadWithFilters
+      },
+      {
+        label: 'v3.5',
+        url: 'https://api.livechatinc.com/v3.5/configuration/action/register_webhook',
+        body: payloadWithFilters
+      },
+      {
+        label: 'v3.3 (fallback)',
+        url: 'https://api.livechatinc.com/v3.3/configuration/action/register_webhook',
+        body: payloadBase
+      }
+    ];
+
+    for (const attempt of attempts) {
+      const result = await attemptRegistration(attempt);
+      if (result.ok) {
+        registered = true;
+        break;
       }
     }
+
+    if (!registered) {
+      const err = `Failed to register action ${action}. Check credentials and retry.`;
+      console.error(err);
+      failures.push(action);
+    }
   }
-  console.error('All attempts failed. Last error:', lastErr?.response?.data || lastErr?.message);
-  process.exit(1);
+
+  if (failures.length) {
+    console.error(`❌ Webhook registration failed for: ${failures.join(', ')}`);
+    process.exit(1);
+  }
+
+  console.log('🎉 All requested webhooks registered successfully.');
 }
 
 register();

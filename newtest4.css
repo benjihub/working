@@ -1,22 +1,79 @@
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,Cantarell,sans-serif;background:#f8fafc;color:#334155;line-height:1.6}
+.auth-screen{position:fixed;inset:0;background:#0b1b34;color:#e9efff;display:flex;align-items:stretch;justify-content:center;z-index:2000}
+.auth-container{display:grid;grid-template-columns:1.1fr 1fr;width:100%;max-width:1100px;min-height:100vh}
+.auth-left{background:#0a1633;display:flex;align-items:center;justify-content:center;padding:2rem}
+.brand-mark{display:flex;align-items:center;gap:1rem}
+.logo-shape{position:relative;width:42px;height:60px}
+.logo-shape .flame{position:absolute;border-radius:10px 30px 10px 30px;transform:rotate(45deg)}
+.logo-shape .flame.a{width:40px;height:40px;background:#2563eb;left:0;bottom:0;filter:drop-shadow(0 6px 14px rgba(37,99,235,0.4))}
+.logo-shape .flame.b{width:30px;height:30px;background:#3b82f6;left:14px;bottom:12px;filter:drop-shadow(0 6px 14px rgba(59,130,246,0.35))}
+.logo-shape .flame.c{width:20px;height:20px;background:#60a5fa;left:24px;bottom:22px;filter:drop-shadow(0 6px 14px rgba(96,165,250,0.3))}
+.brand-text{font-size:1.4rem;font-weight:700;letter-spacing:0.4px}
+.auth-right{background:linear-gradient(180deg,#0b1b34,#102a5c 60%,#12346b);display:flex;align-items:center;justify-content:center;padding:2rem}
+.auth-card{background:#0f2042;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:26px 28px;width:100%;max-width:420px;box-shadow:0 8px 32px rgba(0,0,0,0.35)}
+.auth-title{font-size:1.75rem;font-weight:700;margin-bottom:6px}
+.auth-sub{opacity:0.85;margin-bottom:18px}
+.form-row{display:flex;flex-direction:column;gap:6px;margin-bottom:14px}
+.auth-input{background:#0d1d3b;border:1px solid rgba(255,255,255,0.14);border-radius:10px;color:#e8efff;padding:12px 14px;font-size:15px}
+.auth-input:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,0.2)}
+.btn-auth{background:#f97316;border:none;color:#fff;padding:12px 16px;border-radius:10px;font-weight:600;cursor:pointer;transition:transform .15s ease, background .2s ease}
+.btn-auth:hover{background:#ea580c;transform:translateY(-1px)}
+.auth-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:6px}
+.auth-link{color:#93c5fd;text-decoration:none;font-size:0.95rem}
+.auth-link:hover{text-decoration:underline}
+.auth-error{min-height:20px;color:#fda4af;font-size:0.95rem;margin-top:2px}
+.auth-accent{position:fixed;left:0;right:0;bottom:0;height:6px;background:linear-gradient(90deg,#1d4ed8,#2563eb,#60a5fa)}
+.auth-accent.thin{height:2px;opacity:.6;bottom:6px}
+.auth-accent.faint{height:2px;opacity:.25;bottom:10px}
 .header{background:#1e293b;color:white;padding:1rem 2rem;position:fixed;top:0;left:0;right:0;z-index:1000;box-shadow:0 2px 10px rgba(0,0,0,0.1)}
+.header-inner{display:flex;align-items:center;justify-content:space-between;gap:1rem}
 .header h1{font-size:1.5rem;font-weight:600}
-.nav{background:white;border-bottom:1px solid #e2e8f0;padding:0 2rem;position:fixed;top:70px;left:0;right:0;z-index:999}
-.nav-tabs{display:flex;gap:2rem}
+.header-actions{display:flex;align-items:center;gap:0.75rem}
+.header-actions #globalGroupSelect{appearance:none;background:rgba(255,255,255,0.06);color:#e5e7eb;border:1px solid rgba(255,255,255,0.18);border-radius:10px;padding:10px 12px;font-weight:600;letter-spacing:.2px;box-shadow:inset 0 1px 0 rgba(255,255,255,0.06);}
+.header-actions #globalGroupSelect:focus{outline:none;border-color:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,0.25)}
+.header-actions #globalGroupSelect option{color:#111827;background:#fff}
+/* New: App header styles to match current markup */
+.app-header{background:#1e293b;color:#fff;padding:0.85rem 2rem;position:fixed;top:0;left:0;right:0;z-index:1000;box-shadow:0 2px 10px rgba(0,0,0,0.1);display:flex;align-items:center;justify-content:space-between;gap:1rem}
+.app-header .brand{font-size:1.25rem;font-weight:700}
+.app-header .header-left,.app-header .header-right{display:flex;align-items:center;gap:0.75rem}
+.app-header #globalGroupSelect{appearance:none;background:rgba(255,255,255,0.06);color:#e5e7eb;border:1px solid rgba(255,255,255,0.18);border-radius:10px;padding:10px 12px;font-weight:600;letter-spacing:.2px;box-shadow:inset 0 1px 0 rgba(255,255,255,0.06)}
+.app-header #globalGroupSelect:focus{outline:none;border-color:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,0.25)}
+.app-header .btn{height:38px}
+.app-header .badge{background:#111827;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12)}
+.app-header .group-widget .label{font-size:12px;color:#cbd5e1;opacity:0.9}
+.badge{display:inline-block;padding:0.25rem 0.5rem;border-radius:9999px;font-size:0.8rem;font-weight:600}
+.badge.master{background:#16a34a;color:#fff}
+.badge.agent{background:#3b82f6;color:#fff}
+.badge.owner{background:#9333ea;color:#fff}
+.nav{background:white;border-bottom:1px solid #e2e8f0;padding:0 2rem;position:fixed;top:64px;left:0;right:0;z-index:999}
+.nav-inner{display:flex;align-items:center;justify-content:space-between;gap:1rem}
+.nav-tabs{display:flex;gap:2rem;max-width:1200px;margin:0 auto}
+.nav-right{display:flex;align-items:center}
 .nav-tab{padding:1rem 0;cursor:pointer;border-bottom:2px solid transparent;font-weight:500;transition:all 0.2s}
 .nav-tab:hover{color:#3b82f6}
 .nav-tab.active{color:#3b82f6;border-bottom-color:#3b82f6}
-.main-content{margin-top:140px;padding:2rem;max-width:1200px;margin-left:auto;margin-right:auto}
+.nav-tab.attention{color:#f97316;border-bottom-color:#f97316;position:relative}
+.main-content{margin-top:120px;padding:2rem;max-width:1200px;margin-left:auto;margin-right:auto}
 .tab-content{display:none}
 .tab-content.active{display:block}
 .card{background:white;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.1);margin-bottom:2rem}
-.card-header{padding:1.5rem 2rem;border-bottom:1px solid #e2e8f0;font-weight:600;font-size:1.1rem}
+.card-header{padding:1.25rem 1.75rem;border-bottom:1px solid #e2e8f0;font-weight:600;font-size:1.05rem;background:linear-gradient(to bottom,#ffffff 0%,#fafbfc 100%)}
 .card-body{padding:2rem}
 .grid{display:grid;gap:2rem}
 .grid-2{grid-template-columns:1fr 1fr}
-.grid-3{grid-template-columns:1fr 2fr}
-.grid-3{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+.grid-3{grid-template-columns:repeat(3,minmax(0,1fr))}
+/* Dedicated layout for the Live Chat section: left list + right messages - WIDER chat area */
+.grid-chat{grid-template-columns:380px 1fr}
+
+/* Dashboard tidy-up */
+.dashboard-stats{margin-bottom:1rem}
+.dashboard-stats .stat-card{display:flex;flex-direction:column;justify-content:center;align-items:center;min-height:130px;padding:1.75rem}
+.dashboard-panels{align-items:stretch}
+.dashboard-panels .card{height:100%;display:flex;flex-direction:column}
+.dashboard-panels .card-body{flex:1}
+.actions-stack{display:flex;flex-direction:column;gap:0.75rem}
+.actions-stack .btn{width:100%;justify-content:center}
 .stat-card{background:white;padding:2rem;border-radius:8px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.1)}
 .stat-number{font-size:2.5rem;font-weight:700;color:#1e293b;margin-bottom:0.5rem}
 .stat-label{color:#64748b;font-size:0.9rem;text-transform:uppercase;letter-spacing:0.5px}
@@ -32,18 +89,49 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubunt
 .btn-danger:hover{background:#dc2626}
 .btn-outline{background:transparent;border:1px solid #d1d5db;color:#374151}
 .btn-outline:hover{background:#f9fafb;transform:none}
+
+/* Custom refresh button with icon */
+.btn-refresh{background:linear-gradient(135deg,#3b82f6 0%,#2563eb 100%);color:#fff;border:none;padding:0.65rem 1.2rem;border-radius:8px;cursor:pointer;font-size:0.95rem;font-weight:600;display:inline-flex;align-items:center;gap:0.5rem;transition:all 0.2s;box-shadow:0 2px 8px rgba(59,130,246,0.25)}
+.btn-refresh:hover{background:linear-gradient(135deg,#2563eb 0%,#1d4ed8 100%);transform:translateY(-1px);box-shadow:0 4px 12px rgba(59,130,246,0.35)}
+.btn-refresh:active{transform:translateY(0);box-shadow:0 2px 6px rgba(59,130,246,0.2)}
+.btn-refresh svg{animation:spin-pause 2s infinite}
+@keyframes spin-pause{0%{transform:rotate(0deg)}10%{transform:rotate(360deg)}100%{transform:rotate(360deg)}}
+@keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
+
+/* Custom send button with icon */
+.btn-send{background:linear-gradient(135deg,#10b981 0%,#059669 100%);color:#fff;border:none;padding:0.875rem 1.5rem;border-radius:8px;cursor:pointer;font-size:1rem;font-weight:600;display:inline-flex;align-items:center;gap:0.5rem;transition:all 0.2s;box-shadow:0 2px 8px rgba(16,185,129,0.25);min-width:110px;justify-content:center}
+.btn-send:hover{background:linear-gradient(135deg,#059669 0%,#047857 100%);transform:translateY(-1px);box-shadow:0 4px 12px rgba(16,185,129,0.35)}
+.btn-send:active{transform:translateY(0);box-shadow:0 2px 6px rgba(16,185,129,0.2)}
+.btn-send svg{transition:transform 0.2s}
+.btn-send:hover svg{transform:translateX(2px)}
+
+/* Quick response buttons */
+.btn-quick{background:#f8fafc;border:1px solid #e2e8f0;color:#475569;padding:0.5rem 0.875rem;border-radius:6px;cursor:pointer;font-size:0.875rem;font-weight:500;transition:all 0.15s;display:inline-flex;align-items:center;gap:0.35rem}
+.btn-quick:hover{background:#fff;border-color:#cbd5e1;color:#1e293b;transform:translateY(-1px);box-shadow:0 2px 8px rgba(0,0,0,0.08)}
+.btn-quick:active{transform:translateY(0)}
+
+/* Hide loading indicator - chats load in background */
+.loading-indicator{display:none !important}
+
+/* Small icon buttons for chat header */
+.icon-btn{background:#fff;border:1px solid #d1d5db;color:#111827;border-radius:6px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;font-size:14px;line-height:1;transition:all 0.15s}
+.icon-btn:hover{background:#f9fafb}
+.icon-btn:focus{outline:none;box-shadow:0 0 0 2px rgba(59,130,246,0.35)}
+.icon-btn.success{border-color:#16a34a;color:#16a34a;background:#f0fdf4}
+.icon-btn.success:hover{background:#dcfce7}
 .promotion-item{display:flex;justify-content:space-between;align-items:flex-start;padding:1.5rem;border-bottom:1px solid #f1f5f9;transition:background-color 0.2s}
 .promotion-item:hover{background:#f8fafc}
 .promotion-item:last-child{border-bottom:none}
 .promotion-info h3{color:#1e293b;margin-bottom:0.5rem;font-size:1.1rem}
 .promotion-info p{color:#64748b;margin-bottom:0.25rem}
 .promotion-code{background:#f1f5f9;padding:0.25rem 0.5rem;border-radius:4px;font-family:'Courier New',monospace;font-size:0.9rem;color:#1e293b;font-weight:600}
-.ticket-item{padding:1.5rem;border-bottom:1px solid #f1f5f9;transition:background-color 0.2s;cursor:pointer}
-.ticket-item:hover{background:#f8fafc}
-.ticket-item.selected{background:#dbeafe;border-left:4px solid #3b82f6}
-.ticket-item.unread{background:#fef3c7;border-left:4px solid #f59e0b}
+.ticket-item{padding:1.25rem 1.5rem;border-bottom:1px solid #f1f5f9;transition:all 0.2s;cursor:pointer;position:relative}
+.ticket-item:hover{background:#f8fafc;border-left:3px solid #cbd5e1}
+.ticket-item.selected{background:#eff6ff;border-left:4px solid #3b82f6;box-shadow:inset 0 0 0 1px rgba(59,130,246,0.1)}
+.ticket-item.unread{background:#fffbeb;border-left:4px solid #f59e0b}
 .ticket-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:1rem}
-.ticket-id{font-weight:600;color:#3b82f6}
+.ticket-id{font-weight:600;color:#1e293b;font-size:0.95rem}
+.ticket-id b{color:#3b82f6}
 .ticket-status{padding:0.25rem 0.75rem;border-radius:20px;font-size:0.85rem;font-weight:500;text-transform:uppercase;letter-spacing:0.5px}
 .status-open{background:#fef3c7;color:#92400e}
 .status-assigned{background:#dbeafe;color:#1e40af}
@@ -51,21 +139,318 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubunt
 .ticket-user{color:#64748b;font-size:0.9rem;margin-bottom:0.5rem}
 .ticket-message{background:#f8fafc;padding:1rem;border-radius:6px;margin-bottom:1rem;border-left:4px solid #e2e8f0}
 .ticket-actions{display:flex;gap:0.5rem}
-.chat-container{height:500px;display:flex;flex-direction:column}
-.chat-messages{flex:1;overflow-y:auto;padding:1rem;background:#f8fafc;border-radius:6px;margin-bottom:1rem}
-.chat-message{margin-bottom:1rem;padding:0.75rem;border-radius:6px;max-width:80%;position:relative}
-.chat-message.user{background:#e2e8f0;margin-left:auto;border-bottom-right-radius:2px}
-.chat-message.support{background:#dbeafe;color:#1e40af;border-bottom-left-radius:2px}
+.chat-container{height:75vh;display:flex;flex-direction:column}
+.chat-messages{flex:1;overflow-y:auto;padding:1.5rem;background:#f8fafc;border-radius:8px;margin-bottom:1rem}
+.chat-message{margin-bottom:1.25rem;padding:1rem 1.25rem;border-radius:10px;max-width:75%;position:relative;box-shadow:0 1px 3px rgba(0,0,0,0.08)}
+.chat-message.user{background:#fff;margin-left:auto;border-bottom-right-radius:4px;border:1px solid #e5e7eb}
+.chat-message.support{background:linear-gradient(135deg,#dbeafe 0%,#e0f2fe 100%);color:#0c4a6e;border-bottom-left-radius:4px;border:1px solid #bae6fd}
 .chat-message .message-time{font-size:0.75rem;color:#64748b;margin-top:0.25rem}
 .chat-message .message-author{font-weight:600;margin-bottom:0.25rem}
-.chat-input-container{background:white;padding:1rem;border-top:1px solid #e2e8f0}
-.chat-input{display:flex;gap:0.5rem;margin-bottom:1rem}
-.chat-input input{flex:1;padding:0.75rem;border:1px solid #d1d5db;border-radius:6px;font-size:1rem}
-.chat-input input:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,0.1)}
+.chat-input-container{background:#fafbfc;padding:1.5rem;border-top:1px solid #e2e8f0;border-radius:0 0 8px 8px}
+.chat-input{display:flex;gap:0.75rem;margin-bottom:1rem}
+.chat-input input{flex:1;padding:0.875rem 1rem;border:2px solid #e5e7eb;border-radius:8px;font-size:1rem;background:#fff;transition:all 0.2s}
+.chat-input input:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 4px rgba(59,130,246,0.1)}
 .preview-box{background:#f1f5f9;padding:1.5rem;border-radius:6px;border-left:4px solid #3b82f6;font-family:'Courier New',monospace;white-space:pre-wrap;font-size:0.9rem;line-height:1.5}
+
+/* Modal styles aligned to markup: .modal is backdrop container; .modal-content is dialog */
+.modal{position:fixed;inset:0;background:rgba(15,23,42,0.6);display:none;align-items:center;justify-content:center;z-index:2000}
+.modal.modal-show{display:flex}
+.modal-content{background:#fff;border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,0.2);width:100%;max-width:420px;overflow:hidden}
+.modal-header{padding:1rem 1.25rem;border-bottom:1px solid #e2e8f0;font-weight:600;display:flex;align-items:center;justify-content:space-between}
+.modal-body{padding:1.25rem}
+.modal-actions{display:flex;gap:0.75rem;justify-content:flex-end;padding:1rem 1.25rem;border-top:1px solid #e2e8f0}
+.text-muted{color:#64748b}
+.text-danger{color:#dc2626}
+.text-success{color:#16a34a}
+/* ==========================
+   ADMIN SECTION STYLES
+   ========================== */
+
+/* Admin Section Container */
+.admin-section{margin-bottom:2.5rem}
+.admin-section:last-child{margin-bottom:0}
+
+/* Admin Section Titles */
+.section-title{font-size:1.5rem;font-weight:700;color:#1e293b;margin-bottom:1.25rem;padding-bottom:0.75rem;border-bottom:2px solid #e2e8f0}
+.theme-dark .section-title{color:#e5e7eb;border-bottom-color:rgba(148,163,184,0.25)}
+
+/* Admin Form Rows - Standardized Layouts */
+.admin-form-row{display:flex;gap:0.75rem;flex-wrap:wrap;align-items:center;margin-bottom:1rem}
+
+/* Admin Input Sizing Classes */
+.admin-input-small{width:120px;min-width:120px}
+.admin-input-medium{width:240px;min-width:200px;flex-shrink:0}
+.admin-input-flex{flex:1;min-width:200px}
+.admin-input-full{width:100%;min-width:0}
+
+/* Admin Select Sizing */
+.admin-select{min-width:180px;appearance:none;background:#fff;border:1px solid #d1d5db;border-radius:6px;padding:0.75rem;font-size:1rem;transition:border-color 0.2s}
+.admin-select:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,0.1)}
+.theme-dark .admin-select{background:#0f172a;border:1px solid rgba(148,163,184,0.25);color:#e5e7eb}
+.theme-dark .admin-select:focus{border-color:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,0.15)}
+
+/* Admin Textareas */
+.admin-textarea{width:100%;padding:0.75rem;border:1px solid #d1d5db;border-radius:6px;font-size:1rem;font-family:inherit;resize:vertical;transition:border-color 0.2s}
+.admin-textarea:focus{outline:none;border-color:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,0.1)}
+.theme-dark .admin-textarea{background:#0f172a;border:1px solid rgba(148,163,184,0.25);color:#e5e7eb}
+.theme-dark .admin-textarea:focus{border-color:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,0.15)}
+
+/* Admin Labels */
+.admin-label{font-weight:600;color:#374151;white-space:nowrap}
+.theme-dark .admin-label{color:#cbd5e1}
+
+/* Admin Checkbox Labels */
+.admin-checkbox-label{display:flex;gap:0.5rem;align-items:center;white-space:nowrap;font-weight:500}
+
+/* Admin Description Text */
+.admin-description{color:#64748b;margin-bottom:1rem;font-size:0.95rem;line-height:1.5}
+.admin-description.admin-warning{color:#92400e;background:#fef3c7;padding:0.75rem;border-radius:6px;border-left:4px solid #f59e0b}
+.theme-dark .admin-description{color:#94a3b8}
+.theme-dark .admin-description.admin-warning{color:#fbbf24;background:#2a1e0b;border-left-color:#f59e0b}
+
+/* Admin Status Messages */
+.admin-status{margin-top:0.75rem;color:#64748b;font-size:0.95rem}
+.theme-dark .admin-status{color:#94a3b8}
+
+/* Admin Stats Display */
+.admin-stats{margin-top:1rem;display:flex;flex-direction:column;gap:0.75rem}
+.admin-stat-item{display:flex;justify-content:space-between;align-items:center;padding:0.75rem;background:#f8fafc;border-radius:6px}
+.admin-stat-label{color:#64748b;font-weight:500}
+.admin-stat-value{color:#1e293b;font-size:1.25rem}
+.theme-dark .admin-stat-item{background:#0f172a}
+.theme-dark .admin-stat-label{color:#94a3b8}
+.theme-dark .admin-stat-value{color:#e5e7eb}
+
+/* Admin Table Wrapper */
+.admin-table-wrapper{overflow:auto;margin-top:1rem}
+.admin-table{width:100%;min-width:700px;border-collapse:separate;border-spacing:0}
+.admin-table thead th{background:#f8fafc;color:#475569;font-weight:600;padding:0.75rem;text-align:left;border-bottom:1px solid #e2e8f0}
+.admin-table tbody td{padding:0.75rem;vertical-align:middle;border-bottom:1px solid #f1f5f9}
+.admin-table tbody td:last-child{white-space:nowrap}
+.admin-table tbody td:last-child .btn{margin-right:0.5rem}
+.admin-table tbody td:last-child .btn:last-child{margin-right:0}
+.theme-dark .admin-table thead th{background:#0f172a;color:#cbd5e1;border-bottom:1px solid rgba(148,163,184,0.15)}
+.theme-dark .admin-table tbody td{border-bottom:1px solid rgba(148,163,184,0.08);color:#e5e7eb}
+
+/* Admin Promotion Form - Special Grid Layout */
+.admin-promo-form{display:grid;grid-template-columns:180px 1fr 1fr 120px;gap:0.75rem;align-items:center}
+.admin-promo-form input[type="text"]:nth-child(6),
+.admin-promo-form input[type="text"]:nth-child(7){grid-column:span 4}
+.admin-promo-form .btn{grid-column:span 4;justify-self:start}
+
+/* Admin List (for promotions list, etc) */
+.admin-list{margin-top:1rem;max-height:300px;overflow:auto;border:1px solid #e2e8f0;border-radius:6px;padding:0.5rem}
+.theme-dark .admin-list{border-color:rgba(148,163,184,0.15);background:#0f172a}
+
+/* Admin Activity Log */
+.admin-activity-log{font-size:0.95rem;color:#475569;line-height:1.6}
+.theme-dark .admin-activity-log{color:#94a3b8}
+
+/* Group Checks (Checkbox Pills) */
+.group-checks{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.group-checks .group-check{display:inline-flex;gap:6px;align-items:center;background:#f8fafc;border:1px solid #e2e8f0;border-radius:9999px;padding:4px 10px;font-size:0.9rem}
+.theme-dark .group-checks .group-check{background:#0f172a;border-color:rgba(148,163,184,0.25);color:#e5e7eb}
+
+/* Legacy Agent Widget Support */
+.agents-widget .control-row{gap:0.75rem;row-gap:0.75rem;margin-bottom:1rem}
+.agents-widget select[multiple]{min-width:240px;min-height:120px;padding:0.4rem;border:1px solid #d1d5db;border-radius:6px}
+.agents-widget label{white-space:nowrap}
+.theme-dark .agents-widget select[multiple]{background:#0f172a;border:1px solid rgba(148,163,184,0.25);color:#e5e7eb}
+
+/* Responsive Admin Layout */
+@media (max-width:1024px){
+.admin-promo-form{grid-template-columns:1fr 1fr;gap:0.75rem}
+.admin-promo-form input[type="text"]:nth-child(6),
+.admin-promo-form input[type="text"]:nth-child(7){grid-column:span 2}
+.admin-promo-form .btn{grid-column:span 2}
+.admin-table-wrapper{border:1px solid #e2e8f0;border-radius:6px;padding:0.5rem}
+.theme-dark .admin-table-wrapper{border-color:rgba(148,163,184,0.15)}
+}
+
+@media (max-width:768px){
+.admin-form-row{flex-direction:column;align-items:stretch}
+.admin-input-medium,.admin-input-flex,.admin-select,.admin-input-small{width:100%;min-width:0}
+.admin-checkbox-label{margin-top:0.5rem}
+.admin-promo-form{grid-template-columns:1fr;gap:0.75rem}
+.admin-promo-form input[type="text"]:nth-child(6),
+.admin-promo-form input[type="text"]:nth-child(7),
+.admin-promo-form .btn{grid-column:span 1}
+.section-title{font-size:1.25rem}
+.admin-section{margin-bottom:2rem}
+.admin-table{font-size:0.85rem}
+.admin-table thead th,
+.admin-table tbody td{padding:0.5rem}
+}
+@media (max-width:1024px){
+.grid-chat{grid-template-columns:320px 1fr}
+}
 @media (max-width:768px){
 .main-content{padding:1rem}
 .grid-2{grid-template-columns:1fr}
+.grid-3{grid-template-columns:1fr}
+.grid-chat{grid-template-columns:1fr}
+.dashboard-stats .stat-card{min-height:unset}
 .promotion-item,.ticket-header{flex-direction:column;align-items:flex-start;gap:1rem}
 .nav-tabs{gap:1rem}
 }
+
+/* --- Group Widget (inline in navbar) --- */
+.group-widget{display:flex;align-items:center;gap:12px}
+.group-widget .group-label{font-size:12px;color:#64748b}
+/* support legacy markup that uses .label inside group-widget */
+.group-widget .label{font-size:12px;color:#64748b}
+#groupWidgetText{display:inline-flex;align-items:center;gap:10px;background:linear-gradient(180deg,#0b1220,#0f172a);border:1px solid rgba(148,163,184,0.35);color:#e5e7eb;padding:8px 14px;border-radius:9999px;font-size:13px;font-weight:800;box-shadow:inset 0 1px 0 rgba(255,255,255,0.05),0 3px 14px rgba(2,6,23,0.4)}
+#groupWidgetText::before{content:"";width:10px;height:10px;border-radius:9999px;background:radial-gradient(circle at 30% 30%,#34d399,#10b981 60%,#059669);box-shadow:0 0 0 2px rgba(16,185,129,0.18),0 0 12px rgba(16,185,129,0.4)}
+#groupWidgetText .sub{font-weight:700;color:#a3b0c2}
+/* Chips used in Agent My Groups */
+.chips{display:flex;flex-wrap:wrap;gap:8px}
+.chip{border:1px solid #e2e8f0;background:#fff;color:#111827;border-radius:9999px;padding:6px 12px;font-size:13px;font-weight:600;cursor:pointer}
+.chip:hover{background:#f8fafc}
+.chip.active{background:#dbeafe;border-color:#3b82f6;color:#1e3a8a}
+.theme-dark .chip{border-color:rgba(148,163,184,0.25);background:#0f172a;color:#e5e7eb}
+.theme-dark .chip:hover{background:#111827}
+.theme-dark .chip.active{background:#0b2942;border-color:#3b82f6;color:#cde3ff}
+
+/* ==========================
+	THEME OVERRIDES
+	Light is the current default; add .theme-dark adjustments
+	========================== */
+
+/* Base */
+body.theme-light{background:#f8fafc;color:#334155}
+body.theme-dark{background:#0b1220;color:#e5e7eb}
+
+/* Header */
+.theme-dark .header{background:#0f172a;color:#e5e7eb;box-shadow:0 2px 10px rgba(0,0,0,0.5)}
+.theme-dark .badge{filter:none}
+/* New: dark theme for app header */
+.theme-dark .app-header{background:#0f172a;color:#e5e7eb;box-shadow:0 2px 10px rgba(0,0,0,0.5)}
+.theme-dark .app-header #globalGroupSelect{background:rgba(255,255,255,0.06);color:#e5e7eb;border:1px solid rgba(148,163,184,0.28)}
+.theme-dark .app-header #globalGroupSelect:focus{border-color:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,0.18)}
+.theme-dark .app-header .badge{background:#0b1220;border-color:rgba(148,163,184,0.28);color:#e5e7eb}
+
+/* Nav */
+.theme-dark .nav{background:#0b1220;border-bottom:1px solid rgba(148,163,184,0.18)}
+.theme-dark .nav-tab{color:#cbd5e1;border-bottom-color:transparent}
+.theme-dark .nav-tab.attention{color:#fbbf24;border-bottom-color:#fbbf24}
+.theme-dark .nav-tab:hover{color:#60a5fa}
+.theme-dark .nav-tab.active{color:#60a5fa;border-bottom-color:#60a5fa}
+
+/* Cards & sections */
+.theme-dark .card{background:#0b1220;border:1px solid rgba(148,163,184,0.12);box-shadow:0 1px 3px rgba(0,0,0,0.5)}
+.theme-dark .card-header{border-bottom:1px solid rgba(148,163,184,0.15);color:#e2e8f0;background:linear-gradient(to bottom,#0b1220 0%,#0a1018 100%)}
+.theme-dark .card-body{color:#cbd5e1}
+
+/* Dashboard stats */
+.theme-dark .stat-card{background:#0b1220;color:#e5e7eb;box-shadow:0 1px 3px rgba(0,0,0,0.5)}
+.theme-dark .stat-number{color:#e5e7eb}
+.theme-dark .stat-label{color:#94a3b8}
+
+/* Forms */
+.theme-dark .form-group label{color:#cbd5e1}
+.theme-dark .form-group input,
+.theme-dark .form-group textarea{background:#0f172a;border:1px solid rgba(148,163,184,0.25);color:#e5e7eb}
+.theme-dark .form-group input::placeholder,
+.theme-dark .form-group textarea::placeholder{color:#64748b}
+.theme-dark .form-group input:focus,
+.theme-dark .form-group textarea:focus{border-color:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,0.15)}
+
+/* Buttons */
+.theme-dark .btn{box-shadow:none}
+.theme-dark .btn-outline{border:1px solid rgba(148,163,184,0.35);color:#e5e7eb}
+.theme-dark .btn-outline:hover{background:#111827}
+/* Dark theme for icon buttons */
+.theme-dark .icon-btn{background:#0b1220;border:1px solid rgba(148,163,184,0.35);color:#e5e7eb}
+.theme-dark .icon-btn:hover{background:#111827}
+.theme-dark .icon-btn:focus{box-shadow:0 0 0 2px rgba(96,165,250,0.35)}
+.theme-dark .icon-btn.success{border-color:#16a34a;color:#86efac;background:#052e16}
+.theme-dark .icon-btn.success:hover{background:#064e1a}
+/* Dark theme for new custom buttons */
+.theme-dark .btn-refresh{background:linear-gradient(135deg,#2563eb 0%,#1d4ed8 100%);box-shadow:0 2px 8px rgba(37,99,235,0.4)}
+.theme-dark .btn-refresh:hover{background:linear-gradient(135deg,#1d4ed8 0%,#1e40af 100%);box-shadow:0 4px 12px rgba(37,99,235,0.5)}
+.theme-dark .btn-send{background:linear-gradient(135deg,#059669 0%,#047857 100%);box-shadow:0 2px 8px rgba(5,150,105,0.4)}
+.theme-dark .btn-send:hover{background:linear-gradient(135deg,#047857 0%,#065f46 100%);box-shadow:0 4px 12px rgba(5,150,105,0.5)}
+.theme-dark .btn-quick{background:#0f172a;border-color:rgba(148,163,184,0.35);color:#cbd5e1}
+.theme-dark .btn-quick:hover{background:#1e293b;border-color:#475569;color:#e5e7eb;box-shadow:0 2px 8px rgba(0,0,0,0.3)}
+
+/* Promotions list */
+.theme-dark .promotion-item{border-bottom:1px solid rgba(148,163,184,0.12)}
+.theme-dark .promotion-item:hover{background:#0f172a}
+.theme-dark .promotion-info h3{color:#e2e8f0}
+.theme-dark .promotion-info p{color:#94a3b8}
+.theme-dark .promotion-code{background:#111827;color:#e2e8f0}
+
+/* Tickets */
+.theme-dark .ticket-item{border-bottom:1px solid rgba(148,163,184,0.12)}
+.theme-dark .ticket-item:hover{background:#0f172a;border-left-color:#475569}
+.theme-dark .ticket-item.selected{background:#0f294b;border-left-color:#3b82f6;box-shadow:inset 0 0 0 1px rgba(59,130,246,0.2)}
+.theme-dark .ticket-item.unread{background:#2a1e0b;border-left-color:#f59e0b}
+.theme-dark .ticket-id{color:#cbd5e1}
+.theme-dark .ticket-id b{color:#60a5fa}
+.theme-dark .ticket-user{color:#94a3b8}
+.theme-dark .ticket-message{background:#0f172a;border-left-color:#334155}
+
+/* Chat */
+.theme-dark .chat-messages{background:#0f172a}
+.theme-dark .chat-message.user{background:#1f2937;border-color:#374151;color:#e5e7eb}
+.theme-dark .chat-message.support{background:linear-gradient(135deg,#0c2d48 0%,#0b2942 100%);border-color:#1e3a5f;color:#cde3ff}
+.theme-dark .chat-message .message-time{color:#94a3b8}
+.theme-dark .chat-input-container{background:#0b1220;border-top:1px solid rgba(148,163,184,0.15)}
+.theme-dark .chat-input input{background:#0f172a;border:2px solid rgba(148,163,184,0.25);color:#e5e7eb}
+.theme-dark .chat-input input:focus{border-color:#60a5fa;box-shadow:0 0 0 4px rgba(96,165,250,0.15)}
+
+/* Preview / code */
+.theme-dark .preview-box{background:#111827;border-left-color:#3b82f6;color:#e5e7eb}
+
+/* Modal (dark theme) */
+.theme-dark .modal{background:rgba(2,6,23,0.7)}
+.theme-dark .modal-content{background:#0b1220;color:#e5e7eb;border:1px solid rgba(148,163,184,0.15)}
+.theme-dark .modal-header{border-bottom:1px solid rgba(148,163,184,0.15)}
+.theme-dark .modal-actions{border-top:1px solid rgba(148,163,184,0.15)}
+
+/* Tables (Admin) */
+.theme-dark .agents-widget thead th{background:#0f172a;color:#cbd5e1;border-bottom:1px solid rgba(148,163,184,0.15)}
+.theme-dark .agents-widget tbody td{border-bottom:1px solid rgba(148,163,184,0.08);color:#e5e7eb}
+.theme-dark .agents-widget select[multiple]{background:#0f172a;border:1px solid rgba(148,163,184,0.25);color:#e5e7eb}
+
+/* Misc text */
+.theme-dark .text-muted{color:#94a3b8}
+.theme-dark #recentActivity{color:#94a3b8}
+
+/* Global group select in header */
+.theme-dark .header-actions #globalGroupSelect{background:rgba(255,255,255,0.06);color:#e5e7eb;border:1px solid rgba(148,163,184,0.28)}
+.theme-dark .header-actions #globalGroupSelect:focus{border-color:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,0.18)}
+
+/* ==========================
+	Toast Notifications
+	Styles inspired by the provided screenshot
+	========================== */
+#toastHost{position:fixed;top:90px;right:20px;display:flex;flex-direction:column;gap:10px;z-index:3000;pointer-events:none}
+.toast{min-width:280px;max-width:520px;background:#fff;border-radius:8px;border:1px solid #e2e8f0;box-shadow:0 8px 24px rgba(0,0,0,0.12);display:flex;align-items:flex-start;gap:12px;padding:12px 14px;pointer-events:auto;transform:translateY(8px);opacity:0;animation:toast-in .2s ease-out forwards}
+.toast .t-icon{flex:0 0 22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:14px;color:#fff}
+.toast .t-body{flex:1;color:#334155}
+.toast .t-title{font-weight:700;margin-bottom:2px}
+.toast .t-msg{font-size:0.95rem;white-space:pre-line}
+.toast .t-close{appearance:none;border:none;background:transparent;color:#64748b;font-size:16px;cursor:pointer;line-height:1;padding:0 2px;margin-left:6px}
+.toast.info{background:#eff6ff;border-color:#dbeafe}
+.toast.info .t-icon{background:#3b82f6}
+.toast.info .t-title{color:#1e3a8a}
+.toast.warning{background:#fefce8;border-color:#fde68a}
+.toast.warning .t-icon{background:#f59e0b}
+.toast.warning .t-title{color:#92400e}
+.toast.error{background:#fef2f2;border-color:#fecaca}
+.toast.error .t-icon{background:#ef4444}
+.toast.error .t-title{color:#991b1b}
+.toast.success{background:#f0fdf4;border-color:#bbf7d0}
+.toast.success .t-icon{background:#16a34a}
+.toast.success .t-title{color:#166534}
+@keyframes toast-in{from{transform:translateY(8px);opacity:0}to{transform:translateY(0);opacity:1}}
+@keyframes toast-out{from{transform:translateY(0);opacity:1}to{transform:translateY(-6px);opacity:0}}
+
+/* Dark theme overrides for toasts */
+.theme-dark #toastHost .toast{background:#0b1220;border-color:rgba(148,163,184,0.25)}
+.theme-dark #toastHost .toast .t-body{color:#e5e7eb}
+.theme-dark #toastHost .toast.info{background:#0b1f3a;border-color:rgba(96,165,250,0.35)}
+.theme-dark #toastHost .toast.warning{background:#2a1e0b;border-color:rgba(245,158,11,0.35)}
+.theme-dark #toastHost .toast.error{background:#3b0a0a;border-color:rgba(239,68,68,0.35)}
+.theme-dark #toastHost .toast.success{background:#052e16;border-color:rgba(22,163,74,0.35)}

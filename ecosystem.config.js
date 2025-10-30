@@ -2,7 +2,7 @@ module.exports = {
   apps: [
     {
       name: "goodcasino-server",
-      script: "server.js",
+  script: "server2.js",
       cwd: __dirname,
       env: {
         NODE_ENV: "production"

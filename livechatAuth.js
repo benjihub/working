@@ -1,5 +1,6 @@
 // livechatAuth.js
 // Builds LiveChat Authorization headers with sane preference order.
+require('dotenv').config({ override: true });
 
 function buildBasicFromUserPass(user, pass) {
   const token = Buffer.from(`${user}:${pass}`, 'utf8').toString('base64');

@@ -1,6 +1,6 @@
 // deleteWebhook.js
 // Delete a LiveChat webhook by ID
-require('dotenv').config();
+require('dotenv').config({ override: true });
 const axios = require('axios');
 const { getHeaderVariants } = require('./livechatAuth');
 
