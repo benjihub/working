@@ -2,11 +2,8 @@
 async function addPromotion() {
     const title = document.getElementById('promoTitle').value.trim();
     const description = document.getElementById('promoDescription').value.trim();
-    const discount = document.getElementById('promoDiscount').value;
-    const code = document.getElementById('promoCode').value.trim();
-    
-    if (!title || !description || !discount) {
-        alert('Please fill in Title, Description, and Discount fields');
+    if (!title || !description) {
+        alert('Please fill in Title and Description fields');
         return;
     }
     
@@ -21,8 +18,6 @@ async function addPromotion() {
                 <div class="promotion-info">
                     <h3>${title}</h3>
                     <p>${description}</p>
-                    <p><strong>${discount}% off at xyz.com</strong></p>
-                    <p>Code: <span class="promotion-code">${code || 'N/A'}</span></p>
                 </div>
                 <div>
                     <button class="btn btn-danger" onclick="deletePromotion(${promotionId})">Delete</button>
@@ -36,17 +31,17 @@ async function addPromotion() {
         // Clear the form
         document.getElementById('promoTitle').value = '';
         document.getElementById('promoDescription').value = '';
-        document.getElementById('promoDiscount').value = '';
-        document.getElementById('promoCode').value = '';
+        const terms = document.getElementById('promoTerms');
+        const how = document.getElementById('promoHow');
+        if (terms) terms.value = '';
+        if (how) how.value = '';
         
         // Update the promotions array and UI
         if (!window.promotions) window.promotions = [];
         window.promotions.unshift({
             id: promotionId,
             title,
-            description,
-            discount,
-            code: code || ''
+            description
         });
         
         // Update the bot response
