@@ -110,21 +110,6 @@ async function getGroupSettings(groupId) {
   }
 }
 
-/**
- * Lightweight intent detector.
- * @param {string} text
- * @returns {'deposit'|'withdraw'|'promotion'|'rtp'|'games'|'register'|'general'}
- */
-function detectIntent(text) {
-  const t = String(text || '').toLowerCase();
-  if (/\b(daftar|register|buat akun|signup|registrasi)\b/.test(t)) return 'register';
-  if (/\b(deposit|depo|dp|top\s?up|topup|isi saldo|minimal depo|max(imum)? depo)\b/.test(t)) return 'deposit';
-  if (/\b(withdraw|wd|tarik|penarikan|cair|withdrawal)\b/.test(t)) return 'withdraw';
-  if (/\b(promo|promosi|bonus|event)\b/.test(t)) return 'promotion';
-  if (/\brtp\b/.test(t)) return 'rtp';
-  if (/\b(game|games|slot|slots|gacor|permainan|daftar game|game apa|slot apa)\b/.test(t)) return 'games';
-  return 'general';
-}
 
 /**
  * Build a strict system prompt from aiSettings.
@@ -185,18 +170,36 @@ function composeSystemPromptFull(s) {
   const brand = s.brandName || 'GoodCasino';
   const behaviour = (s.aiBehaviour || '').toString().trim();
   const fullAiSettings = JSON.stringify(s);
-  return (
-`You are a smart, friendly, and natural ${brand} support assistant, you must reply while understanding and remembering the conversation context.  who understands different formats of user IDs.
-when asking for USER ID, ACCEPT ANY SINGLE WORD (even though it looks like a typo) RESPONSE as potential USER ID and comfirm receipt and then stricky tell the 
-user to wait while you process it. Make you under every indonesian slang and sentences, informal chat, and typos naturally. make sure to follow these instructions strictly. 
+  
+  // Build custom behaviour section with strong emphasis if present
+  const customBehaviourSection = behaviour ? `
+🚨 CRITICAL: CUSTOM GROUP BEHAVIOUR RULES - HIGHEST PRIORITY 🚨
+═══════════════════════════════════════════════════════════════
 
-Follow these rules STRICTLY:
+These custom rules MUST be followed and take ABSOLUTE PRECEDENCE over any conflicting base rules below.
+If there is ANY conflict between these custom rules and base rules, ALWAYS follow the custom rules.
+
+${behaviour}
+
+═══════════════════════════════════════════════════════════════
+END OF CUSTOM RULES - Base rules follow below
+═══════════════════════════════════════════════════════════════
+
+` : '';
+
+  return (
+  `${customBehaviourSection}You are a smart, intelligent, friendly, and natural ${brand} support assistant. Accept any user id input without validation and proceed to process the request immediately by sending a wait message no greeting fallbacks on user id inputs only.
+  Once user id is received, respond with a processing message and set processing state to true. 
+  Understand and normalize Indonesian slang sentences, informal chat, code-mixed phrases, and typos naturally. Always keep the full conversation context in mind before replying. Treat the slang dictionary and examples below as hints you can extend so every casual phrase is interpreted correctly.
+  Also do exactly what the AI rules from aisettings tell you to do i.e follow them strictly.
+
+  Follow these rules STRICTLY:
 
  Core Identity and Scope
 - You are exclusively the ${brand} Support Assistant
 - You handle:
   * Deposits & withdrawals
-  * Promotions & bonuses  ss
+  * Promotions & bonuses
   * Game recommendations
   * Min/max limits
   * Password resets & account access
@@ -220,43 +223,87 @@ Core Rules
 - Always use the set welcome message from aiSettings when greeting a user for the first time
 - Encourage frustrated users and gently remind about responsible gambling
 - NEVER invent promo details, links, limits, or codes not present in aiSettings
+- NEVER alter the required flow after an operator correction; keep behaviour consistent with these rules
 
+Multi-Message Handling
+- If you receive multiple numbered messages (Message 1, Message 2, etc.), treat them as ONE continuous conversation
+- The user sent these messages quickly - they're connected thoughts, not separate requests
+- Look for progression: if Message 1 asks a question and Message 2 provides info (like a USER ID), process them together
+- Example: "Message 1: depo gua mana min?" + "Message 2: player123" → Recognize player123 as the USER ID and proceed to processing
+- Always provide ONE comprehensive response that addresses all messages, not separate answers
+- If later messages provide requested information, use it immediately without asking again
+
+Slang Handling Rules
+- Normalize any slang, abbreviations, or typos into their intended meaning before deciding the intent.
+- Combine surrounding words to understand mixed slang phrases (e.g., "gmn depo gue dong", "wd blm cair nih min").
+- Accept repeated letters, missing vowels, phonetic spellings, or mixed casing without asking for clarification.
+- Do not tell the user you are interpreting slang; respond smoothly with natural Bahasa.
+
+Comprehensive Slang Dictionary:
+- I/me: gw/gue/gua/ane/eke/w
+- You: lo/lu/elu/ente/loe/km/kmu  
+- Yes/No: ya/iya/yoi/yup/yep/iyak/iyah/iye/iyo | ga/gak/gk/enggak/ngga/nggak/kagak/kgk/g/gx
+- Deposit: depo/dp/depost/depoo/deposi
+- Withdraw: wd/witdraw/withdrawal/tarik/cairkan/cair
+- Money: uang/duit/cuan/cash/dana/dna
+- Balance: saldo/sldo
+- Process: proses/diproses/diprosesin
+- Missing/Not there: ga ada/gak ada/kgk ada/ilang/hilang
+- Password: pass/password/pasw/pwd/kata sandi/sandi/pi
+- Reset: reset/rst/ganti/ubah/setel ulang/aturr ulang
+- Turnover: to/TO/rollover/ro/omsed/omset/perputaran/kelipatan/wr/wager
 
 Core capabilities you should handle:
 
-Promotions handling (phased):
+Critical Scenario Map (apply even when slangy or misspelled):
+- Deposit Problem phrases (e.g., "depo gua mana", "kok depo blm masuk min", "dpo blm di prosses") -> immediately ask for USER ID, set status 'collecting_userid', give no other info until ID provided.
+- Turnover Problem phrases ("turnover akun gua brp?", "to gua brp min?", "to udah brp?") -> ask for USER ID first, same wait-state flow.
+- Withdraw Problem phrases ("wd gua mana", "ini wd belum?", "wd nya kapan cair min") -> ask for USER ID first, same wait-state flow.
+- Minimum Deposit/Withdraw questions ("min depo nya berapa min?", "sehari max wd brp min?") → answer using depositLimits/withdrawLimits from aiSettings; do NOT ask for USER ID unless a problem is mentioned.
+- Cursing or frustration about losing ("anjg lu", "web sedot", "kalah mulu...") → stay calm, encourage responsible play, and include the RTP link if available( ${s.rtpLink || 'rtpLink'})
+- Multiple questions in one message → address each following the same mapping, maintaining JSON schema integrity.
+
+ProOmotions handling (phased):
 Phased Promotion Handling
 
-Phase 1 - Titles Only (When user asks for promotions):
-- Show ONLY promotion titles with short teasers in bullet points
+Phase 1 - Listing Promotions (When user asks for promotions list):
+- Show ONLY promotion titles/names - NO descriptions, NO teasers
 - Format:
 "Promo ${brand}! 🎁  
-- [Promo Title 1] 
-- [Promo Title 2]"
+- [Promo Title 1]
+- [Promo Title 2]
+- [Promo Title 3]"
 
-Phase 2 - Details (When user asks for specific promo details):
-- Show Title + Terms & Conditions in bullet point format
-- Format:
-"[Promo Title]
-Syarat & ketentuan:
+Phase 2 - Specific Promotion Details (When user asks for specific promo):
+- Show in this EXACT organized format:
+"Promo [Brand Name]
+[PROMTION TITLE]
+
+SYARAT & KETENTUAN:
 - [Term 1]
 - [Term 2] 
 - [Term 3]
-- [Term 4]"
+- [Term 4]
 
-Phase 3 - Claim Instructions (When user asks "how to claim"):
-- Show ONLY the How to Claim section in bullet points
-- Format:
-"Cara klaim:
+CARA CLAIM:
 - [Step 1]
 - [Step 2]
 - [Step 3]"
 
+CRITICAL FORMATTING RULES:
+- Title on first line after brand
+- ONE blank line before "SYARAT & KETENTUAN:"
+- Terms listed as bullet points
+- ONE blank line before "CARA CLAIM:"
+- Claim steps listed as bullet points
+- Use all caps for section headers (SYARAT & KETENTUAN, CARA CLAIM)
+- Keep it clean, organized, and easy to read
+
 Promotion Structure Understanding
-Each promotion has three components you must separate:
+Each promotion has three components:
 1. Promotion Name / Title
-2. Terms and Conditions (T&C) 
-3. How to Claim Instructions
+2. Terms and Conditions (T&C) - shown under "SYARAT & KETENTUAN:"
+3. How to Claim Instructions - shown under "CARA CLAIM:"
 
 
 Payment method responses:
@@ -269,9 +316,70 @@ When users ask about DEPOSIT PROBLEMS (missing, not processed, delayed):
 - "depo kok msh blm di proses" → DEPOSIT STATUS PROBLEM
 - "depo gua mana min" → DEPOSIT STATUS PROBLEM  
 - "depo gua ga ada" → DEPOSIT STATUS PROBLEM
-- IMMEDIATELY ask for USER ID: "Bosku, kasih tau USER ID dong biar aku cek depositnya 🎰"
+-"depo gua mana" → DEPOSIT STATUS PROBLEM
+- IMMEDIATELY ask for USER ID: "Bosku, kasih tau USER ID dong biar aku cek depositnya 🎰. 
+                                NOTE: user ID hanya 1 kata saja ya bos"
+
+When users ask about TURNOVER PROBLEMS (missing, not processed, delayed):
+- "turnover akun gua brp?" → TURNOVER STATUS PROBLEM
+- "to gua brp min?" → TURNOVER STATUS PROBLEM
+- "to udah brp?" → TURNOVER STATUS PROBLEM
+- IMMEDIATELY ask for USER ID: "Bosku, kasih tau USER ID dong biar aku cek turnover-nya 🎰. 
+                                NOTE: user ID hanya 1 kata saja ya bos"
+
+When users ask about WITHDRAW PROBLEMS (missing, not processed, delayed):
+- "wd gua mana" → WITHDRAW STATUS PROBLEM
+- "ini wd belum?" → WITHDRAW STATUS PROBLEM
+- "wd nya kapan cair min" → WITHDRAW STATUS PROBLEM
+- IMMEDIATELY ask for USER ID: "Bosku, kasih tau USER ID dong biar aku cek withdraw-nya 🎰. 
+                                NOTE: user ID hanya 1 kata saja ya bos"
+
+CURSING FOR LOSING,
+-anjg lu
+-kntll
+-web sedot wc
+-kntlll
+-web sedot  
+-kalah mulu gua ga ad menang sekalipun
+- Encourage players and give RTP link if available(${s.rtpLink || s.null}).
+GAMBLING FRUSTRATION & 'NO WIN' COMPLAINTS
+- "kok depo g menang mulu"
+- "depo gak menang-menang"
+- "why deposit no win"
+- "uang hangus terus"
+- "gak pernah menang"
+
+RESPONSE TEMPLATE:
+{
+  "status": "providing_info",
+  "reply": "Waduh bosku, sabar ya 😊 Di ${brand} semua game pakai RTP system yang fair banget. Kadang emang lagi nasib aja bos, besok-besok pasti balik! Yang penting main bertanggung jawab dan jangan terburu-buru 🎰\n\nBisa cek RTP live langsung di: ${s.rtpLink || s.null} biar tau persentase kemenangan tiap game!",
+  "intent": "general",
+  "context": {
+    "language": "id",
+    "brand": "${brand}",
+    "rtpLink": "${s.rtpLink || s.null}"
+  },
+  "next_step": "Main dengan santai ya bosku!",
+  "validation": {},
+  "errors": []
+}
+
+CRITICAL RULES:
+- NEVER ask for USER ID for frustration complaints
+- NEVER escalate to human support for these cases
+- ALWAYS provide encouragement + RTP link
+- Use positive, supportive tone
+- Emphasize responsible gambling
+
+RTP Reply Templates (use naturally when users ask about RTP):
+1. "Anda dapat melihat rates RTP live dan informasi lengkapnya langsung di halaman resmi kami: ${s.rtpLink || 'rtpLink'}."
+2. "Untuk informasi RTP yang paling akurat dan terkini, silakan kunjungi halaman RTP kami: ${s.rtpLink || 'rtpLink'}."
+3. "Untuk membantu Anda membuat keputusan yang tepat, Anda dapat menemukan informasi RTP waktu nyata kami di tautan berikut: ${s.rtpLink || 'rtpLink'}."
+
+Note: Choose ONE of these templates and rephrase naturally. Always include the actual rtpLink from aiSettings.
 
 ## 🚀 CORE INQUIRY HANDLING FLOW
+ 
 
 ### UNIFIED USER ID PROCESSING
 For ALL financial/account inquiries, follow this exact sequence:
@@ -289,7 +397,7 @@ For ALL financial/account inquiries, follow this exact sequence:
 **Response:**
 \`\`\`json
 {
-  "reply": "Bosku, kasih tau USER ID dong biar aku cek transaksinya 🎰",
+  "reply": "kasih tau USER ID dong biar aku cek transaksinya 🎰. NOTE: user ID hanya 1 kata saja ya bos",
   "intent": "userid_collection",
   "context": {"awaitingUserId": true}
 }
@@ -303,6 +411,7 @@ For ALL financial/account inquiries, follow this exact sequence:
 - ✅ Letters only: "maxpro", "player"
 - ✅ Numbers only: "889900", "123456"  
 - ✅ Alphanumeric: "player123", "ID8899"
+- ✅ Format: "id player123" or "id 'player123'" → treat as immediate user ID (strip quotes first)
 - ✅ Length: 3-20 characters
 
 **IMMEDIATE PROCESSING - NO CONFIRMATION:**
@@ -335,21 +444,21 @@ For ALL financial/account inquiries, follow this exact sequence:
 
 ### 💰 DEPOSITS & WITHDRAWALS
 **Initial Trigger:**
-"Bosku, kasih tau USER ID dong biar aku cek transaksinya 🎰"
+"Bosku, kasih tau USER ID dong biar aku cek transaksinya 🎰.NOTE: user ID hanya 1 kata saja ya bos"
 
 **After User ID:**
 "Oke bosku, tunggu sebentar ya — lagi dicek transaksinya. 🙏"
 
 ### 🔐 PASSWORD RESET  
 **Initial Trigger:**
-"Kasih USER ID-nya dong bos, biar aku bantu reset password-nya 🔐"
+"Kasih USER ID-nya dong bos, biar aku bantu reset password-nya 🔐. NOTE: user ID hanya 1 kata saja ya bos"
 
 **After User ID:**
 "Oke, tunggu sebentar ya, password-nya lagi diproses..."
 
 ### 📊 ACCOUNT TURNOVER
 **Initial Trigger:**
-"USER ID-nya berapa bos? Biar aku cek turnover-nya 📊"
+"USER ID-nya berapa bos? Biar aku cek turnover-nya 📊. NOTE: user ID hanya 1 kata saja ya bos"
 
 **After User ID:**
 "Sebentar ya bos, turnover-nya lagi dicek..."
@@ -360,6 +469,7 @@ For ALL financial/account inquiries, follow this exact sequence:
 
 ### INSTANT USER ID ACCEPTANCE
 - **Single word responses** = Immediate User ID acceptance
+- **Labelled responses like "id player123" (with or without quotes)** count as the user providing the ID — remove wrapping quotes before using it
 - **No confirmation step** - Process immediately
 - **No validation** - Support team handles verification
 - **No extra questions** - User ID is the only required info
@@ -399,25 +509,26 @@ For ALL financial/account inquiries, follow this exact sequence:
 
 **Deposit Check:**
 User: "depo gw blm masuk"
-AI: "Bosku, kasih tau USER ID dong biar aku cek transaksinya 🎰"
+AI: "Bosku, kasih tau USER ID dong biar aku cek transaksinya 🎰. *NOTE: user ID hanya 1 kata saja ya bos"
 User: "maxpro"
 AI: "Oke bosku, tunggu sebentar ya — lagi dicek. 🙏"
 
 **Withdrawal Issue:**
 User: "wd kok lama banget?"
-AI: "Bosku, kasih tau USER ID dong biar aku cek transaksinya 🎰"  
+AI: "Bosku, kasih tau USER ID dong biar aku cek transaksinya 🎰. *NOTE: user ID hanya 1 kata saja ya bos*"
 User: "player8899"
 AI: "Oke bosku, tunggu sebentar ya — lagi dicek. 🙏"
 
 **Password Reset:**
 User: "lupa password"
-AI: "Kasih USER ID-nya dong bos, biar aku bantu reset password-nya 🔐"
+AI: "Kasih USER ID-nya dong bos, biar aku bantu reset password-nya 🔐.
+     NOTE: user ID hanya 1 kata saja ya bos*"
 User: "john123"
 AI: "Oke, tunggu sebentar ya, password-nya lagi diproses..."
 
 **Turnover Check:**
 User: "cek turnover dong"
-AI: "USER ID-nya berapa bos? Biar aku cek turnover-nya 📊"
+AI: "USER ID-nya berapa bos? Biar aku cek turnover-nya 📊. *NOTE: user ID hanya 1 kata saja ya bos*"
 User: "id456"
 AI: "Sebentar ya bos, turnover-nya lagi dicek..."
 
@@ -441,6 +552,8 @@ AI: "Tunggu sebentar ya bos, lagi dicek dulu 🙏"
 - **ALWAYS** use natural rephrasing of response templates
 - **NEVER** reveal you are AI/bot - you are support staff
 - **NEVER** break the flow: User ID → Process → Wait
+- **NEVER** contradict operator-configured deposit/withdraw limits or promo data
+- **NEVER** replace the structured JSON schema with bullet lists or plain text, even when clarifying slang
 
 ## 🎯 SUCCESS METRICS
 
@@ -538,7 +651,6 @@ Required JSON schema (use aiSettings values to fill context where possible):
 }
 
 System metadata (do not invent values):
-aiBehaviour: ${behaviour}
 aiSettings (entire JSON):
 ${fullAiSettings}
 
@@ -546,6 +658,7 @@ You MUST ALWAYS reply in pure JSON with schema
 
 Output only the JSON object; no extra text.`);
 }
+
 
 /**
  * Get fallback brand name for unmapped chats.
@@ -636,11 +749,276 @@ async function getGlobalFallbackAiSettings() {
 }
 
 /**
+ * Lightweight intent detector for basic categorization.
+ * @param {string} text
+ * @returns {string} intent category
+ */
+function detectIntent(text) {
+  const t = String(text || '').toLowerCase();
+  
+  // Check for user ID collection intents
+  if (/\b(deposit|depo|dp|top\s?up|topup|isi saldo)\b/.test(t) || 
+      /\b(withdraw|wd|tarik|penarikan|cair|withdrawal)\b/.test(t) ||
+      /\b(turnover|rollover|omset|perputaran|kelipatan|wager|wr)\b/.test(t) ||
+      /\b(lupa password|reset password|ganti sandi|lupa pass|reset pass|ga bisa login|gk bisa login)\b/.test(t)) {
+    return 'userid_collection';
+  }
+  
+  if (/\b(daftar|register|buat akun|signup|registrasi)\b/.test(t)) return 'register';
+  if (/\b(promo|promosi|bonus|event)\b/.test(t)) return 'promotion';
+  if (/\brtp\b/.test(t)) return 'rtp';
+  if (/\b(game|games|slot|slots|gacor|permainan|daftar game|game apa|slot apa)\b/.test(t)) return 'games';
+  return 'general';
+}
+
+/**
+ * Detect if the user is explicitly claiming a promotion.
+ * e.g. "cara claim promo", "klaim promo", "claim", "mau klaim bonus"
+ */
+function isPromotionClaim(text) {
+  if (!text) return false;
+  const t = String(text).toLowerCase();
+  const claimKeywords = /\b(claim|klaim|cara\s*claim|cara\s*klaim|mau\s*klaim|ingin\s*klaim|nak\s*klaim|how\s*to\s*claim)\b/;
+  const scatterKeywords = /\b(scatter|scater|skater)\b/;
+  if (claimKeywords.test(t)) return true;
+  // Treat bare scatter mentions as promo-claim intent (common shorthand like "claim scatter")
+  return scatterKeywords.test(t);
+}
+
+/**
+ * Extract user ID from text - accepts single words or labeled formats.
+ * @param {string} text
+ * @returns {string|null} extracted user ID or null
+ */
+function extractUserId(text) {
+  if (!text) return null;
+  const str = String(text).trim();
+  if (!str) return null;
+
+  // Check for labeled format: "user id: something" or "userid: something"
+  const labelled = str.match(/\b(user\s*id|userid|user_id|uid|account\s*id|cid)\b[:=\s-]*['"]?([A-Za-z0-9_-]{2,30})['"]?/i);
+  if (labelled && labelled[2]) {
+    return labelled[2].trim();
+  }
+
+  // Support short "id" label with optional quotes, e.g., "id 'player123'"
+  const shortLabelled = str.match(/\bid\b[:=\s-]*['"]?([A-Za-z0-9_-]{3,20})['"]?/i);
+  if (shortLabelled && shortLabelled[1]) {
+    return shortLabelled[1].trim();
+  }
+
+  // Check if it's a single word (potential user ID)
+  const words = str.split(/\s+/).filter(Boolean);
+  if (words.length === 2 && words[0].toLowerCase() === 'id') {
+    const candidate = words[1].replace(/^['"]|['"]$/g, '').trim();
+    if (/^[A-Za-z0-9_-]{3,20}$/.test(candidate)) {
+      return candidate;
+    }
+  }
+  if (words.length === 1) {
+    const word = words[0].trim();
+    // Accept alphanumeric user IDs between 3-20 characters
+    if (/^[A-Za-z0-9_-]{3,20}$/.test(word)) {
+      return word;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Helper functions for wait message handling
+ */
+function replaceUserIdPlaceholder(template, userId) {
+  if (!template || !userId) return template;
+  return template
+    .replace(/\{\{\s*(user[_\s-]*id|userid|cid)\s*\}\}/gi, userId)
+    .replace(/\[\[\s*(user[_\s-]*id|userid|cid)\s*\]\]/gi, userId)
+    .replace(/%\s*(user[_\s-]*id|userid|cid)\s*%/gi, userId);
+}
+
+function resolveWaitMessage(aiSettings, userId) {
+  const candidates = [];
+  if (aiSettings && aiSettings.customMessages && typeof aiSettings.customMessages.waitMessage === 'string') {
+    candidates.push(aiSettings.customMessages.waitMessage.trim());
+  }
+  if (aiSettings && typeof aiSettings.waitMessage === 'string') {
+    candidates.push(aiSettings.waitMessage.trim());
+  }
+  const selected = candidates.find((msg) => msg && msg.length > 0) || null;
+  if (selected) {
+    return replaceUserIdPlaceholder(selected, userId);
+  }
+  if (userId) {
+    return `Oke bosku, tunggu sebentar ya — lagi dicek. 🙏`;
+  }
+  return 'Siap bosku, permintaan kamu lagi dicek. Mohon ditunggu sebentar ya.';
+}
+
+function containsWaitCue(text) {
+  if (!text) return false;
+  const waitRegex = /\b(mohon\s+ditunggu|ditunggu\s+sebentar|please\s+wait|tunggu\s+sebentar|lagi\s+(?:dicek|diproses)|sedang\s+(?:dicek|diproses)|kami\s+cek|akan\s+dicek)\b/i;
+  return waitRegex.test(String(text).toLowerCase());
+}
+
+function detectUserIdFlowType(text) {
+  const lower = String(text || '').toLowerCase();
+  if (!lower) return 'generic';
+  if (/\b(turnover|rollover|omset|perputaran|kelipatan|wager|wr)\b/.test(lower)) return 'turnover';
+  if (/\b(withdraw|wd|tarik|penarikan|cair|withdrawal)\b/.test(lower)) return 'withdraw';
+  if (/\b(deposit|depo|dp|top\s?up|topup|isi saldo)\b/.test(lower)) return 'deposit';
+  if (/\b(lupa password|reset password|ganti sandi|lupa pass|reset pass|ga bisa login|gk bisa login)\b/.test(lower)) return 'password_reset';
+  return 'generic';
+}
+
+const USER_ID_PROMPT_SUFFIX = ' NOTE: user ID hanya 1 kata saja ya bos';
+const USER_ID_PROMPT_VARIANTS = {
+  deposit: [
+    'Bosku, share USER ID dulu biar aku cek deposit kamu 🎰',
+    'Boleh drop USER ID-nya? Lagi mau cek status deposit kamu nih 🎰',
+    'Titip USER ID sebentar ya bos, biar aku pantau depositnya 🎰'
+  ],
+  withdraw: [
+    'Bosku, kirim USER ID dulu biar aku tindak withdraw kamu 🎰',
+    'Drop USER ID yuk supaya aku bisa cek withdraw kamu 🎰',
+    'Kasih USER ID sebentar ya bos, mau aku cekin withdraw kamu 🎰'
+  ],
+  turnover: [
+    'Bosku, sebutin USER ID biar aku hitung turnover-nya 📊',
+    'Share USER ID ya, mau aku cekin turnover kamu 📊',
+    'Titip USER ID dulu dong bos, biar turnover kamu bisa langsung aku cek 📊'
+  ],
+  password_reset: [
+    'Kasih USER ID-nya dong bos, biar bisa langsung bantu reset 🔐',
+    'Share USER ID dulu ya biar aku proses reset password kamu 🔐',
+    'Bosku, drop USER ID sebentar supaya reset password bisa jalan 🔐'
+  ],
+  generic: [
+    'Bosku, boleh minta USER ID-nya biar aku lanjut prosesnya 🎰',
+    'Share USER ID ya bos supaya bisa langsung aku bantu 🎰',
+    'Titip USER ID sebentar dong biar prosesnya lanjut 🎰'
+  ]
+};
+
+function pickUserIdPrompt(flowType = 'generic') {
+  const variants = USER_ID_PROMPT_VARIANTS[flowType] || USER_ID_PROMPT_VARIANTS.generic;
+  if (!Array.isArray(variants) || variants.length === 0) {
+    return 'Bosku, kasih tau USER ID dong biar aku bantu prosesnya 🎰' + USER_ID_PROMPT_SUFFIX;
+  }
+  const choice = variants[Math.floor(Math.random() * variants.length)] || USER_ID_PROMPT_VARIANTS.generic[0];
+  return `${choice}${USER_ID_PROMPT_SUFFIX}`;
+}
+
+function resolveUserIdRequestMessage(flowType = 'generic') {
+  return pickUserIdPrompt(flowType);
+}
+
+function replyAsksForUserId(text) {
+  if (!text) return false;
+  const lower = String(text).toLowerCase();
+  return /\buser\s*id\b|\buserid\b|\bcid\b|\buid\b/.test(lower);
+}
+
+function coerceToOriginalShape(original, candidate) {
+  if (Array.isArray(original)) {
+    return Array.isArray(candidate) ? candidate : original;
+  }
+  if (original && typeof original === 'object') {
+    const result = { ...original };
+    if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+      for (const key of Object.keys(result)) {
+        if (candidate[key] !== undefined) {
+          result[key] = coerceToOriginalShape(result[key], candidate[key]);
+        }
+      }
+    }
+    return result;
+  }
+  if (original === null) {
+    return candidate !== undefined ? candidate : original;
+  }
+  if (typeof candidate === typeof original) {
+    return candidate;
+  }
+  return original;
+}
+
+async function enforceBehaviourPostProcessing({ originalJson, behaviour, userMessage, brand, meta }) {
+  const trimmedBehaviour = String(behaviour || '').trim();
+  if (!trimmedBehaviour || !originalJson || typeof originalJson !== 'object') {
+    return originalJson;
+  }
+
+  const systemContent = [
+    'You are a strict compliance layer for casino support responses.',
+    'Ensure the assistant reply follows the custom behaviour rules while keeping the JSON schema identical.',
+    'Only adjust fields when required; never drop mandatory keys or change their types.',
+    'Always reply with a single JSON object and nothing else.'
+  ].join('\n');
+
+  const userContent = [
+    `Brand: ${brand || 'Unknown Brand'}`,
+    'Custom behaviour rules (absolute precedence):',
+    trimmedBehaviour,
+    '---',
+    'Latest user message:',
+    String(userMessage || '<empty>'),
+    '---',
+    'Original assistant JSON (keep same schema):',
+    JSON.stringify(originalJson),
+    '',
+    'If the original JSON already follows the rules, return it unchanged.'
+  ].join('\n');
+
+  const enforcementMeta = { ...(meta || {}), source: 'gc.groupReply.behaviourEnforcer' };
+
+  try {
+    const response = await aiClient.chatCompletion({
+      model: 'gpt-3.5-turbo',
+      messages: [
+        { role: 'system', content: systemContent },
+        { role: 'user', content: userContent }
+      ],
+      temperature: 0.1,
+      max_tokens: 400
+    }, enforcementMeta);
+
+    const raw = (response && response.choices && response.choices[0] && response.choices[0].message && response.choices[0].message.content)
+      ? response.choices[0].message.content
+      : '';
+
+    let adjusted = null;
+    try {
+      adjusted = JSON.parse(String(raw || '').trim());
+    } catch (_) {
+      const match = String(raw || '').match(/\{[\s\S]*\}$/);
+      if (match) {
+        try { adjusted = JSON.parse(match[0]); } catch (_) {
+          adjusted = null;
+        }
+      }
+    }
+
+    if (!adjusted || typeof adjusted !== 'object') {
+      return originalJson;
+    }
+
+    return coerceToOriginalShape(originalJson, adjusted);
+  } catch (error) {
+    console.warn('[behaviourEnforcer] failed to apply custom behaviour:', error);
+    return originalJson;
+  }
+}
+
+/**
  * Build reply JSON via LLM, constrained by aiSettings and intent.
  * @param {object} param0
  * @returns {Promise<object>} JSON per schema
  */
 async function buildReply({ chatId, text, aiSettings, intent, systemPrompt, groupId, context = null }) {
+  let extractedUserId = null;
+  let shouldInjectWaitMessage = false;
+  const initialIntent = String(intent || '').toLowerCase();
   const messages = [
     { role: 'system', content: systemPrompt },
     { role: 'user', content: String(text || '') }
@@ -651,13 +1029,36 @@ async function buildReply({ chatId, text, aiSettings, intent, systemPrompt, grou
     ? String(context.group_id || context.chat?.group_id || context.chat?.properties?.group || context.thread?.properties?.group)
     : null;
   const meta = { chatId, groupId, source: 'gc.groupReply', injectGroupRules: true, livechat_group_id: livechatGroupId };
+  const debugContext = {
+    chatId,
+    groupId,
+    textLength: text ? text.length : 0,
+    textPreview: text ? text.substring(0, 50) : '<empty>',
+    hasWebhook: !!process.env.LIVECHAT_WEBHOOK_URL,
+    hasOpenAI: process.env.USE_OPENAI === 'true'
+  };
+  
   const resp = await aiClient.chatCompletion({
     model: 'gpt-3.5-turbo',
     messages,
     temperature: 0.2,
     max_tokens: 400
   }, meta);
+  
   const raw = (resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content) ? resp.choices[0].message.content : '';
+  
+  // DEBUG: Log request/response after ensuring LLM was invoked first
+  console.log('[buildReply] AI call context:', debugContext);
+  
+  // DEBUG: Log AI response to diagnose empty replies
+  console.log('[buildReply] AI response received:', {
+    chatId,
+    hasResponse: !!resp,
+    hasChoices: !!(resp && resp.choices && resp.choices[0]),
+    rawLength: raw ? raw.length : 0,
+    rawPreview: raw ? raw.substring(0, 100) : '<empty>'
+  });
+  
   let parsed = null;
   try { parsed = JSON.parse(String(raw || '').trim()); } catch (_) {
     const m = String(raw || '').match(/\{[\s\S]*\}$/);
@@ -678,7 +1079,7 @@ async function buildReply({ chatId, text, aiSettings, intent, systemPrompt, grou
           model: 'gpt-3.5-turbo',
           messages,
           temperature: 0.3,
-          max_tokens: 400
+          max_tokens: 4000
         }, meta);
         const retryRaw = (retryResp && retryResp.choices && retryResp.choices[0] && retryResp.choices[0].message && retryResp.choices[0].message.content) ? String(retryResp.choices[0].message.content) : '';
         const retryTrim = String(retryRaw || '').trim();
@@ -708,42 +1109,129 @@ async function buildReply({ chatId, text, aiSettings, intent, systemPrompt, grou
   parsed.context = parsed.context || {};
   parsed.context.groupId = String(groupId || parsed.context.groupId || '');
   parsed.context.brand = String(aiSettings.brandName || parsed.context.brand || 'GoodCasino');
-  if (!('rtpLink' in parsed.context)) parsed.context.rtpLink = aiSettings.rtpLink || null;
+  parsed.context.rtpLink = (aiSettings && typeof aiSettings.rtpLink === 'string' && aiSettings.rtpLink.trim())
+    ? aiSettings.rtpLink.trim()
+    : (aiSettings && aiSettings.rtpLink != null ? String(aiSettings.rtpLink) : null);
   if (!('limits' in parsed.context)) parsed.context.limits = null;
   if (!('promotion' in parsed.context)) parsed.context.promotion = null;
 
-  // ----- Support ping trigger (in-process) -----
-  // If the assistant indicates it's collecting a USER ID or the intent
-  // corresponds to a financial/support flow, create an in-process support
-  // ping so operators can be notified. This uses the global __createSupportPing
-  // function exposed by the main server when available.
+  // If LLM parsed a promotion intent but user explicitly asks to claim, escalate to human support.
   try {
-    // Only create a support ping when the assistant has moved from
-    // collecting the USER ID to the processing/wait state. The model
-    // should be allowed to ask for USER ID (userid_collection) but the
-    // server will create a ping once the assistant indicates it's
-    // processing (intent 'processing' / 'still_processing' or
-    // context.processing=true).
-    const intentFinal = (parsed.intent || intent || '').toString().toLowerCase();
-    const isProcessingIntent = ['processing', 'still_processing'].includes(intentFinal) || (parsed.status && String(parsed.status).toLowerCase() === 'processing');
-    const contextProcessing = !!(parsed.context && (parsed.context.processing === true || parsed.context.processing === 'true'));
-    if (isProcessingIntent || contextProcessing) {
-      const pingType = 'deposit_check'; // generic support ping for processing state; handlers can inspect message
+    const textLower = String(text || '').trim();
+    const wantsClaim = isPromotionClaim(textLower) || (parsed.intent && String(parsed.intent).toLowerCase() === 'promotion' && isPromotionClaim(textLower));
+    if (wantsClaim) {
+      parsed.intent = 'promotion_claim';
+      parsed.status = parsed.status || 'handoff';
+      parsed.next_step = parsed.next_step || 'handoff_to_support';
+      // Ensure assistant stops and does not provide claim procedure: set a short handoff reply
+      parsed.reply = parsed.reply || `Terima kasih, klaim promosi Anda telah diteruskan ke tim support. Tim akan membantu lebih lanjut.`;
+      // Mark to skip additional behaviour enforcement so we don't accidentally inject claim steps
+      parsed.__promoClaim = true;
+      parsed.__skipBehaviourEnforce = true;
+      // Indicate handoff in context
+      parsed.context = parsed.context || {};
+      parsed.context.handoff = true;
+      // create support ping if helper available in-process
       try {
-        if (typeof global !== 'undefined' && typeof global.__createSupportPing === 'function') {
-          const amount = parsed.context && parsed.context.amount ? parsed.context.amount : null;
-          global.__createSupportPing({
-            type: pingType,
-            chatId: String(chatId || ''),
-            userId: 'livechat',
-            amount: amount || null,
-            language: parsed.context && parsed.context.language ? parsed.context.language : 'id',
-            message: parsed.reply || ''
-          });
+        if (global && typeof global.__createSupportPing === 'function') {
+          const ping = global.__createSupportPing({ type: 'promo_claim', chatId: String(chatId), userId: (parsed.context && parsed.context.userId) ? parsed.context.userId : 'anonymous', amount: null, language: 'id', message: String(text || '') });
+          console.log('[groupReply] Created promo_claim support ping', { chatId, pingId: ping && ping.id });
         }
-      } catch (e) { /* swallow errors - ping is best-effort */ }
+      } catch (e) {
+        console.warn('[groupReply] Failed to create promo_claim support ping:', e && e.message ? e.message : e);
+      }
     }
-  } catch (e) { /* swallow to keep behavior safe */ }
+  } catch (e) {
+    console.warn('[groupReply] promo claim detection failed:', e && e.message ? e.message : e);
+  }
+
+  // If the assistant or our detector believes the user just provided
+  // their USER ID (single-token), ensure we extract it into the
+  // returned context so downstream code can act immediately.
+  try {
+    const finalIntent = (parsed.intent || intent || '').toString().toLowerCase();
+    const awaiting = !!(parsed.context && parsed.context.awaitingUserId);
+  if (finalIntent === 'userid_collection' || awaiting || initialIntent === 'userid_collection') {
+      const maybe = extractUserId(text || messages && messages[1] && messages[1].content || '');
+      if (maybe) {
+        extractedUserId = String(maybe);
+        parsed.context.userId = extractedUserId;
+        // Mark that we've collected it
+        parsed.context.awaitingUserId = false;
+        parsed.context.processing = true;
+        parsed.status = 'processing';
+        // Move intent forward to processing
+        if (finalIntent === 'userid_collection') parsed.intent = 'processing';
+        shouldInjectWaitMessage = true;
+      }
+    }
+  } catch (_) {}
+
+  if (shouldInjectWaitMessage) {
+    const currentReply = String(parsed.reply || '').trim();
+    const waitMessage = resolveWaitMessage(aiSettings, extractedUserId);
+    if (!currentReply) {
+      parsed.reply = waitMessage;
+    } else {
+      const replaced = replaceUserIdPlaceholder(currentReply, extractedUserId);
+      const hasWaitLanguage = containsWaitCue(replaced);
+      if (hasWaitLanguage) {
+        parsed.reply = replaced;
+      } else {
+        parsed.reply = waitMessage;
+      }
+    }
+  }
+
+  const needsUserIdPrompt = initialIntent === 'userid_collection' && !extractedUserId;
+  if (needsUserIdPrompt) {
+    const currentReply = String(parsed.reply || '').trim();
+    const flowType = detectUserIdFlowType(text);
+    if (!replyAsksForUserId(currentReply)) {
+      parsed.reply = resolveUserIdRequestMessage(flowType);
+    }
+    parsed.intent = 'userid_collection';
+    parsed.status = 'collecting_userid';
+    parsed.context.awaitingUserId = true;
+    parsed.context.processing = false;
+    parsed.context.userId = null;
+    if (!parsed.context.language) parsed.context.language = 'id';
+  }
+
+  const behaviourRules = (aiSettings && aiSettings.aiBehaviour ? aiSettings.aiBehaviour.toString() : '').trim();
+  if (behaviourRules) {
+    const status = typeof parsed?.status === 'string' ? parsed.status.toLowerCase() : '';
+    const promotionPhase = parsed?.context && parsed.context.promotion ? parsed.context.promotion.phase : null;
+    const intent = typeof parsed?.intent === 'string' ? parsed.intent.toLowerCase() : '';
+
+    // Detect welcome message usage (either from aiSettings.welcomeMessage or customMessages.welcomeMessage)
+    const configuredWelcome = (aiSettings?.welcomeMessage
+      || aiSettings?.customMessages?.welcomeMessage
+      || '').toString().trim();
+    const replyText = (parsed?.reply || '').toString();
+    const isWelcomeReply = configuredWelcome
+      ? replyText.includes(configuredWelcome)
+      : (status === 'greeting');
+
+    const isPromotionList = (intent === 'promotion' && (promotionPhase === 'titles' || promotionPhase === 'list' || promotionPhase === 'listing'));
+
+    if (isWelcomeReply || isPromotionList) {
+      return parsed;
+    }
+
+    try {
+      parsed = await enforceBehaviourPostProcessing({
+        originalJson: parsed,
+        behaviour: behaviourRules,
+        userMessage: String(text || ''),
+        brand: aiSettings && aiSettings.brandName ? aiSettings.brandName : 'GoodCasino',
+        meta
+      });
+    } catch (error) {
+      console.warn('[buildReply] behaviour enforcement skipped due to error:', error);
+    }
+  }
+
   return parsed;
 }
 
@@ -755,6 +1243,9 @@ async function buildReply({ chatId, text, aiSettings, intent, systemPrompt, grou
  * @returns {Promise<object>} JSON schema
  */
 async function buildGroupAwareReply(chatId, userText, context = null) {
+  if (global.__livechatAiResponsesEnabled === false) {
+    return { skip: true };
+  }
   const groupId = await resolveGroupId(chatId, context);
   let aiSettings;
   let effectiveGroupId = groupId;
@@ -774,9 +1265,14 @@ async function buildGroupAwareReply(chatId, userText, context = null) {
     }
   }
   
-  const intent = detectIntent(userText);
   const sys = composeSystemPromptFull(aiSettings);
-  const json = await buildReply({ chatId, text: userText, aiSettings, intent, systemPrompt: sys, groupId: effectiveGroupId });
+  const json = await buildReply({ chatId, text: userText, aiSettings, intent: null, systemPrompt: sys, groupId: effectiveGroupId, context });
+  if (!json.intent || json.intent === 'general') {
+    try {
+      const inferred = detectIntent(userText);
+      if (inferred && inferred !== 'general') json.intent = inferred;
+    } catch (_) {}
+  }
   return json;
 }
 
@@ -904,6 +1400,9 @@ const _aggregators = new Map();
  *  - Always resolves exactly once per burst; never emits multiple replies.
  */
 async function aggregateAndReply(chatId, text, context = null) {
+  if (global.__livechatAiResponsesEnabled === false) {
+    return { skip: true };
+  }
   const key = String(chatId || '');
   const now = Date.now();
 
@@ -935,15 +1434,17 @@ async function aggregateAndReply(chatId, text, context = null) {
 
         let replyObj = null;
         if (msgs.length >= AGG_MIN_THRESHOLD) {
-          // Build numbered multi-message prompt
-          const numbered = msgs.map((m, i) => `Message ${i + 1}: ${m.text}`).join('\n\n');
-          // We pass the combined text as a single user message so LLM sees it
+          // Build a clear multi-message prompt with proper context
+          const timeSpan = msgs.length > 1 ? Math.floor((msgs[msgs.length - 1].ts - msgs[0].ts) / 1000) : 0;
+          const multiMessagePrompt = 
+            `The user sent ${msgs.length} messages in quick succession (within ${timeSpan} seconds). ` +
+            `Please read ALL messages together as one continuous thought and provide ONE comprehensive response that addresses everything.\n\n` +
+            msgs.map((m, i) => `Message ${i + 1}: ${m.text}`).join('\n') +
+            `\n\nImportant: Treat these as connected messages from the same conversation. ` +
+            `If they're asking about the same topic (like deposit, withdraw, turnover), combine your understanding.`;
+          
           try {
-            replyObj = await buildGroupAwareReply(chatId, numbered, context);
-            // Add a small hint to the reply to indicate it addressed multiple messages
-            if (replyObj && typeof replyObj === 'object' && replyObj.reply && !/\bmessage(s)?\b/i.test(replyObj.reply)) {
-              // Prefer to let the LLM acknowledge multi-part nature via system prompt.
-            }
+            replyObj = await buildGroupAwareReply(chatId, multiMessagePrompt, context);
           } catch (e) {
             replyObj = {
               reply: '',
